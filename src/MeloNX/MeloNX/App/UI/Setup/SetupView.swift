@@ -17,7 +17,6 @@ struct SetupView: View {
     @State private var keysImported = false
     @State private var firmImported = false
     @State private var showMainSetup = false
-    @AppStorage("MeloNXAppMode") private var appModeRaw: String = ""
     @AppStorage("skippedSetup") var skippedSetup: Bool = false
     @Binding var isInSetup: Bool
     
@@ -303,14 +302,6 @@ struct SetupView: View {
                                 .padding(.bottom, 20)
                         }
 
-                        Button {
-                            appModeRaw = MeloNXAppMode.controller.rawValue
-                        } label: {
-                            Label("Use this iPhone as Controller", systemImage: "iphone.radiowaves.left.and.right")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        
                         setupStep(
                             title: "Import Keys",
                             description: "Add your encryption keys",

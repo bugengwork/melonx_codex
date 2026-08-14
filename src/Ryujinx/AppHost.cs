@@ -568,9 +568,10 @@ namespace Ryujinx.Ava
 
             _isActive = false;
 
-            // NOTE: The render loop is allowed to stay alive until the renderer itself is disposed, as it may handle resource dispose.
-            // We only need to wait for all commands submitted during the main gpu loop to be processed.
+            // The producer completion barrier is followed by a backend join.
+            // Teardown commands can then transfer backend ownership to this thread.
             _gpuDoneEvent.WaitOne();
+            _renderingThread.Join();
             _gpuDoneEvent.Dispose();
 
             DisplaySleep.Restore();
@@ -1008,6 +1009,50 @@ namespace Ryujinx.Ava
 
         private void RenderLoop()
         {
+            try
+            {
+                RenderLoopCore();
+            }
+            catch (Exception exception)
+            {
+                _isActive = false;
+
+                try
+                {
+                    _gpuCancellationTokenSource.Cancel();
+                }
+                catch (Exception cancellationException)
+                {
+                    Logger.Error?.Print(
+                        LogClass.Gpu,
+                        $"GPU cancellation after renderer failure also failed: {cancellationException}");
+                }
+
+                Logger.Error?.Print(LogClass.Gpu, $"Renderer loop failed: {exception}");
+            }
+            finally
+            {
+                try
+                {
+                    if (Device?.Gpu?.Renderer is ThreadedRenderer threaded)
+                    {
+                        threaded.RequestStopAfterDrain();
+                        threaded.WaitForGpuThreadExit();
+                    }
+                }
+                catch (Exception exception)
+                {
+                    Logger.Error?.Print(LogClass.Gpu, $"Failed to join the GPU producer: {exception}");
+                }
+                finally
+                {
+                    _gpuDoneEvent.Set();
+                }
+            }
+        }
+
+        private void RenderLoopCore()
+        {
             Dispatcher.UIThread.InvokeAsync(() =>
             {
                 if (_viewModel.StartGamesInFullscreen)
@@ -1043,49 +1088,66 @@ namespace Ryujinx.Ava
 
             Device.Gpu.Renderer.RunLoop(() =>
             {
-                Device.Gpu.SetGpuThread();
-                Device.Gpu.InitializeShaderCache(_gpuCancellationTokenSource.Token);
-
-                _renderer.Window.ChangeVSyncMode(Device.EnableDeviceVsync);
-
-                while (_isActive)
+                try
                 {
-                    _ticks += _chrono.ElapsedTicks;
+                    Device.Gpu.SetGpuThread();
+                    Device.Gpu.InitializeShaderCache(_gpuCancellationTokenSource.Token);
 
-                    _chrono.Restart();
+                    _renderer.Window.ChangeVSyncMode(Device.EnableDeviceVsync);
 
-                    if (Device.WaitFifo())
+                    while (_isActive)
                     {
-                        Device.Statistics.RecordFifoStart();
-                        Device.ProcessFrame();
-                        Device.Statistics.RecordFifoEnd();
-                    }
+                        _ticks += _chrono.ElapsedTicks;
 
-                    while (Device.ConsumeFrameAvailable())
-                    {
-                        if (!_renderingStarted)
+                        _chrono.Restart();
+
+                        if (Device.WaitFifo())
                         {
-                            _renderingStarted = true;
-                            _viewModel.SwitchToRenderer(false);
-                            InitStatus();
+                            Device.Statistics.RecordFifoStart();
+                            Device.ProcessFrame();
+                            Device.Statistics.RecordFifoEnd();
                         }
 
-                        Device.PresentFrame(() => (RendererHost.EmbeddedWindow as EmbeddedWindowOpenGL)?.SwapBuffers());
-                    }
+                        while (Device.ConsumeFrameAvailable())
+                        {
+                            if (!_renderingStarted)
+                            {
+                                _renderingStarted = true;
+                                _viewModel.SwitchToRenderer(false);
+                                InitStatus();
+                            }
 
-                    if (_ticks >= _ticksPerFrame)
-                    {
-                        UpdateStatus();
+                            Device.PresentFrame(() => (RendererHost.EmbeddedWindow as EmbeddedWindowOpenGL)?.SwapBuffers());
+                        }
+
+                        if (_ticks >= _ticksPerFrame)
+                        {
+                            UpdateStatus();
+                        }
                     }
                 }
-
-                // Make sure all commands in the run loop are fully executed before leaving the loop.
-                if (Device.Gpu.Renderer is ThreadedRenderer threaded)
+                finally
                 {
-                    threaded.FlushThreadedCommands();
+                    try
+                    {
+                        // Make sure all commands in the run loop are fully executed before leaving the loop.
+                        if (Device.Gpu.Renderer is ThreadedRenderer threaded)
+                        {
+                            try
+                            {
+                                threaded.FlushThreadedCommands();
+                            }
+                            finally
+                            {
+                                threaded.RequestStopAfterDrain();
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        _gpuDoneEvent.Set();
+                    }
                 }
-
-                _gpuDoneEvent.Set();
             });
 
             (RendererHost.EmbeddedWindow as EmbeddedWindowOpenGL)?.MakeCurrent(true);

@@ -16,8 +16,15 @@ namespace Ryujinx.Graphics.GAL.Multithreading.Commands
         public static void Run(ref SetTransformFeedbackBuffersCommand command, ThreadedRenderer threaded, IRenderer renderer)
         {
             Span<BufferRange> buffers = command._buffers.Get(threaded);
-            renderer.Pipeline.SetTransformFeedbackBuffers(threaded.Buffers.MapBufferRanges(buffers));
-            command._buffers.Dispose(threaded);
+
+            try
+            {
+                renderer.Pipeline.SetTransformFeedbackBuffers(threaded.Buffers.MapBufferRanges(buffers));
+            }
+            finally
+            {
+                command._buffers.Dispose(threaded);
+            }
         }
     }
 }

@@ -8,6 +8,34 @@
 import Foundation
 
 final class RyujinxBridge {
+    static let teardownIncompleteResult = -2
+
+    enum EmulationLifecycleDiagnosticField: Int32 {
+        case schemaVersion = 0
+        case currentSessionID = 1
+        case currentSessionState = 2
+        case currentMilestoneMask = 3
+        case lastSessionID = 4
+        case lastSessionState = 5
+        case lastMilestoneMask = 6
+        case lastOrderViolationCount = 7
+        case lastTeardownFailed = 8
+        case lastResultCode = 9
+        case lastPhysicalFootprint = 10
+        case activeGPUThreadCount = 11
+        case activeRenderThreadCount = 12
+        case vulkanInstanceCreatedCount = 13
+        case vulkanInstanceDestroyedCount = 14
+        case vulkanSurfaceCreatedCount = 15
+        case vulkanSurfaceDestroyedCount = 16
+        case vulkanDeviceCreatedCount = 17
+        case vulkanDeviceDestroyedCount = 18
+        case jitMappingCreatedCount = 19
+        case requiredTeardownMilestoneMask = 20
+        case vulkanValidationErrorCount = 21
+        case vulkanDeviceLostCount = 22
+    }
+
     static func initialize() {
         SN_initialize()
     }
@@ -50,6 +78,20 @@ final class RyujinxBridge {
 
     static func stopEmulation() {
         SN_stop_emulation()
+    }
+
+    static func emulationLifecycleDiagnostic(
+        _ field: EmulationLifecycleDiagnosticField
+    ) -> Int64 {
+        SN_get_emulation_lifecycle_diagnostic(field.rawValue)
+    }
+
+    static func prepareEmulationStart() {
+        SN_prepare_emulation_start()
+    }
+
+    static func cancelEmulationStart() {
+        SN_cancel_emulation_start()
     }
 
     static func mainRyu(argv: [String]) -> Int {
@@ -134,7 +176,6 @@ final class RyujinxBridge {
     }
 
     static func setGamepadButtonState(_ id: UnsafeMutableRawPointer?, buttonId: Int, pressed: Bool) {
-        print("Gamepad button State \(Int32(buttonId)), pressed \(pressed)")
         SN_set_gamepad_button_state(id, Int32(buttonId), pressed ? 1 : 0)
     }
 
@@ -188,6 +229,15 @@ func SN_pause_emulation(_ shouldPause: Bool)
 
 @_silgen_name("stop_emulation")
 func SN_stop_emulation()
+
+@_silgen_name("get_emulation_lifecycle_diagnostic")
+func SN_get_emulation_lifecycle_diagnostic(_ field: Int32) -> Int64
+
+@_silgen_name("prepare_emulation_start")
+func SN_prepare_emulation_start()
+
+@_silgen_name("cancel_emulation_start")
+func SN_cancel_emulation_start()
 
 @_silgen_name("initialize")
 func SN_initialize()

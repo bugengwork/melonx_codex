@@ -4,15 +4,16 @@ import UIKit
 import SwiftUI
 
 public class Air {
+    public typealias ConnectionCallbackToken = UUID
     
     static let shared = Air()
     
     public var connected: Bool = false {
         didSet {
-            connectionCallbacks.forEach({ $0(connected) })
+            Array(connectionCallbacks.values).forEach { $0(connected) }
         }
     }
-    var connectionCallbacks: [(Bool) -> ()] = []
+    private var connectionCallbacks: [ConnectionCallbackToken: (Bool) -> Void] = [:]
     
     var airScreen: UIScreen?
     var airWindow: UIWindow?
@@ -53,8 +54,15 @@ public class Air {
         Air.shared.hostingController = nil
     }
     
-    public static func connection(_ callback: @escaping (Bool) -> ()) {
-        Air.shared.connectionCallbacks.append(callback)
+    @discardableResult
+    public static func connection(_ callback: @escaping (Bool) -> Void) -> ConnectionCallbackToken {
+        let token = ConnectionCallbackToken()
+        Air.shared.connectionCallbacks[token] = callback
+        return token
+    }
+
+    public static func removeConnectionCallback(_ token: ConnectionCallbackToken) {
+        Air.shared.connectionCallbacks.removeValue(forKey: token)
     }
     
     @objc func didConnect(sender: NSNotification) {

@@ -16,16 +16,12 @@ class JoystickDPadPoint: ObservableObject {
     func pressed(_ button: VirtualControllerButton, inputSink: ControllerInputSink = LocalControllerInputSink()) {
         guard button.isDPad else { return }
         currentlyPressed.insert(button)
-        print(button)
-        print(currentlyPressed)
         recomputeDPad(inputSink: inputSink)
     }
 
     func released(_ button: VirtualControllerButton, inputSink: ControllerInputSink = LocalControllerInputSink()) {
         guard button.isDPad else { return }
         currentlyPressed.remove(button)
-        print(button)
-        print(currentlyPressed)
         recomputeDPad(inputSink: inputSink)
     }
 
@@ -47,8 +43,6 @@ class JoystickDPadPoint: ObservableObject {
         } else {
             joystickDpadPoint.x = 0
         }
-        
-        print(joystickDpadPoint)
         
         inputSink.setLeftStick(x: Float(joystickDpadPoint.x), y: Float(joystickDpadPoint.y))
     }

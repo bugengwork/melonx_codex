@@ -29,6 +29,7 @@ using Ryujinx.HLE.HOS.Services.Account.Acc;
 using Ryujinx.Input;
 using Ryujinx.Input.HLE;
 using Ryujinx.Input.SDL2;
+using Ryujinx.Memory;
 using Ryujinx.SDL2.Common;
 using Ryujinx.UI.Common.Configuration.System;
 using Silk.NET.Vulkan;
@@ -59,14 +60,44 @@ using LibHac.Ncm;
 using Microsoft.Win32.SafeHandles;
 using System.Text.RegularExpressions;
 using System.Runtime;
+using System.Runtime.ExceptionServices;
 using System.Linq;
 using System.Threading.Tasks;
 using Ryujinx.Input.Native;
 
 namespace Ryujinx.Headless.SDL2
 {
+    internal enum EmulationLifecycleDiagnosticField
+    {
+        SchemaVersion = 0,
+        CurrentSessionId = 1,
+        CurrentSessionState = 2,
+        CurrentMilestoneMask = 3,
+        LastSessionId = 4,
+        LastSessionState = 5,
+        LastMilestoneMask = 6,
+        LastOrderViolationCount = 7,
+        LastTeardownFailed = 8,
+        LastResultCode = 9,
+        LastPhysicalFootprint = 10,
+        ActiveGpuThreadCount = 11,
+        ActiveRenderThreadCount = 12,
+        VulkanInstanceCreatedCount = 13,
+        VulkanInstanceDestroyedCount = 14,
+        VulkanSurfaceCreatedCount = 15,
+        VulkanSurfaceDestroyedCount = 16,
+        VulkanDeviceCreatedCount = 17,
+        VulkanDeviceDestroyedCount = 18,
+        JitMappingCreatedCount = 19,
+        RequiredTeardownMilestoneMask = 20,
+        VulkanValidationErrorCount = 21,
+        VulkanDeviceLostCount = 22,
+    }
+
     class Program
     {
+        private const int TeardownIncompleteResultCode = -2;
+
         public static string Version { get; private set; }
 
         private static VirtualFileSystem _virtualFileSystem;
@@ -75,14 +106,22 @@ namespace Ryujinx.Headless.SDL2
         private static LibHacHorizonManager _libHacHorizonManager;
         private static UserChannelPersistence _userChannelPersistence;
         private static InputManager _inputManager;
-        private static Switch _emulationContext;
-        private static WindowBase _window;
+        private static EmulationSession _currentSession;
+        private static EmulationLifecycleDiagnostics _lastLifecycleDiagnostics;
+        private static long _nextSessionId;
+        private static int _startPending;
+        private static int _pendingStopRequest;
+        private static int _unhandledExceptionHandlerRegistered;
+        private static int _mainThreadDispatcherRegistered;
         private static WindowsMultimediaTimerResolution _windowsMultimediaTimerResolution;
         private static List<InputConfig> _inputConfiguration;
         private static bool _enableKeyboard;
         private static bool _enableMouse;
-        private static IntPtr nativeMetalLayer = IntPtr.Zero;
+        private static IntPtr _pendingNativeMetalLayer = IntPtr.Zero;
         private static readonly object metalLayerLock = new object();
+        private static readonly object inputManagerLock = new object();
+        private static readonly object horizonManagerLock = new object();
+        private static ExceptionDispatchInfo _processInitializationFailure;
 
         private static readonly InputConfigJsonSerializerContext _serializerContext = new(JsonHelper.GetDefaultSerializerOptions());
         private static readonly TitleUpdateMetadataJsonSerializerContext _titleSerializerContext = new(JsonHelper.GetDefaultSerializerOptions());
@@ -97,10 +136,56 @@ namespace Ryujinx.Headless.SDL2
         [UnmanagedCallersOnly(EntryPoint = "main_ryujinx_sdl")]
         public static unsafe int MainExternal(int argCount, IntPtr* pArgs)
         {
-            string[] args = new string[argCount];
+            try
+            {
+                return MainExternalCore(argCount, pArgs);
+            }
+            catch (Exception exception)
+            {
+                LogAbiBoundaryFailure("main_ryujinx_sdl", exception);
+                return TeardownIncompleteResultCode;
+            }
+        }
+
+        private static unsafe int MainExternalCore(int argCount, IntPtr* pArgs)
+        {
+            EmulationSession session = new(Interlocked.Increment(ref _nextSessionId));
+            bool sessionInstalled;
+            int result = 0;
+
+            lock (metalLayerLock)
+            {
+                sessionInstalled = Interlocked.CompareExchange(ref _currentSession, session, null) == null;
+
+                if (sessionInstalled)
+                {
+                    session.SetNativeMetalLayer(_pendingNativeMetalLayer);
+                    _pendingNativeMetalLayer = IntPtr.Zero;
+                }
+            }
+
+            if (!sessionInstalled)
+            {
+                Volatile.Write(ref _startPending, 0);
+                Interlocked.Exchange(ref _pendingStopRequest, 0);
+                Console.WriteLine("An emulation session is already active.");
+
+                return -1;
+            }
+
+            Volatile.Write(ref _startPending, 0);
+
+            if (Interlocked.Exchange(ref _pendingStopRequest, 0) != 0)
+            {
+                session.RequestStop();
+            }
 
             try
             {
+                Volatile.Read(ref _processInitializationFailure)?.Throw();
+
+                string[] args = new string[argCount];
+
                 for (int i = 0; i < argCount; i++)
                 {
                     args[i] = Marshal.PtrToStringAnsi(pArgs[i]);
@@ -112,26 +197,160 @@ namespace Ryujinx.Headless.SDL2
             }
             catch (Exception e)
             {
+                session.RecordFault(e);
                 Console.WriteLine(e.ToString());
-                return -1;
+                result = -1;
+            }
+            finally
+            {
+                if ((int)session.State < (int)EmulationSessionState.GpuDisposing)
+                {
+                    try
+                    {
+                        // Argument parsing and pre-load validation can return before
+                        // a Window/Switch exists. They still need to cross the same
+                        // coordinator boundary before the native entrypoint returns.
+                        ShutdownEmulationInstance(session, null, null, null);
+                    }
+                    catch (Exception exception)
+                    {
+                        session.RecordTeardownFault(exception);
+                        Console.WriteLine(exception.ToString());
+                    }
+                }
+
+                _inputConfiguration = null;
+                UserChannelPersistence userChannelPersistence =
+                    Interlocked.Exchange(ref _userChannelPersistence, null);
+                userChannelPersistence?.Clear();
+
+                lock (metalLayerLock)
+                {
+                    if (!session.HasTeardownFailure && !session.MarkCompleted())
+                    {
+                        session.RecordTeardownFault(
+                            new InvalidOperationException(
+                                $"Emulation session {session.Id} did not reach the GPU teardown boundary."));
+                    }
+
+                    if (session.HasTeardownFailure)
+                    {
+                        session.LogMilestone("TeardownIncomplete");
+                        result = TeardownIncompleteResultCode;
+                    }
+                    else
+                    {
+                        Interlocked.CompareExchange(ref _currentSession, null, session);
+                    }
+
+                    Volatile.Write(
+                        ref _lastLifecycleDiagnostics,
+                        session.CreateDiagnosticsSnapshot(result));
+                }
+
+                Interlocked.Exchange(ref _pendingStopRequest, 0);
             }
 
-            return 0;
+            return result;
         }
 
         [UnmanagedCallersOnly(EntryPoint = "set_native_window")]
-        public static unsafe void SetNativeWindow(IntPtr layer) {
-            lock (metalLayerLock) {
-                nativeMetalLayer = layer;
+        public static unsafe void SetNativeWindow(IntPtr layer)
+        {
+            try
+            {
+                lock (metalLayerLock)
+                {
+                    EmulationSession session = Volatile.Read(ref _currentSession);
+
+                    if (session != null)
+                    {
+                        session.SetNativeMetalLayer(layer);
+                    }
+                    else
+                    {
+                        _pendingNativeMetalLayer = layer;
+                    }
+                }
+
                 Logger.Info?.Print(LogClass.Application, $"SetNativeWindow called with layer: {layer}");
+            }
+            catch (Exception exception)
+            {
+                // Exceptions must not cross the unmanaged ABI boundary.
+                Logger.Error?.Print(LogClass.Application, $"Failed to set native window: {exception}");
             }
         }
 
-        public static IntPtr GetNativeMetalLayer()
+        internal static void LogLifecycleMilestone(string milestone)
         {
-            lock (metalLayerLock)
+            Volatile.Read(ref _currentSession)?.LogMilestone(milestone);
+        }
+
+        [UnmanagedCallersOnly(EntryPoint = "get_emulation_lifecycle_diagnostic")]
+        public static long GetEmulationLifecycleDiagnostic(int field)
+        {
+            try
             {
-                return nativeMetalLayer;
+                EmulationSession currentSession = Volatile.Read(ref _currentSession);
+                EmulationLifecycleDiagnostics last = Volatile.Read(ref _lastLifecycleDiagnostics);
+
+                return (EmulationLifecycleDiagnosticField)field switch
+                {
+                    EmulationLifecycleDiagnosticField.SchemaVersion =>
+                        EmulationLifecycleDiagnostics.SchemaVersion,
+                    EmulationLifecycleDiagnosticField.CurrentSessionId =>
+                        currentSession?.Id ?? 0,
+                    EmulationLifecycleDiagnosticField.CurrentSessionState =>
+                        currentSession != null ? (long)currentSession.State : -1,
+                    EmulationLifecycleDiagnosticField.CurrentMilestoneMask =>
+                        currentSession?.GetLifecycleMilestoneMask() ?? 0,
+                    EmulationLifecycleDiagnosticField.LastSessionId =>
+                        last?.SessionId ?? 0,
+                    EmulationLifecycleDiagnosticField.LastSessionState =>
+                        last?.State ?? -1,
+                    EmulationLifecycleDiagnosticField.LastMilestoneMask =>
+                        last?.MilestoneMask ?? 0,
+                    EmulationLifecycleDiagnosticField.LastOrderViolationCount =>
+                        last?.OrderViolationCount ?? 0,
+                    EmulationLifecycleDiagnosticField.LastTeardownFailed =>
+                        last?.TeardownFailed ?? 0,
+                    EmulationLifecycleDiagnosticField.LastResultCode =>
+                        last?.ResultCode ?? 0,
+                    EmulationLifecycleDiagnosticField.LastPhysicalFootprint =>
+                        last?.PhysicalFootprint ?? -1,
+                    EmulationLifecycleDiagnosticField.ActiveGpuThreadCount =>
+                        ThreadedRenderer.ActiveGpuThreadCount,
+                    EmulationLifecycleDiagnosticField.ActiveRenderThreadCount =>
+                        Volatile.Read(ref WindowBase.ActiveRenderThreadCount),
+                    EmulationLifecycleDiagnosticField.VulkanInstanceCreatedCount =>
+                        VulkanRenderer.InstanceCreatedCount,
+                    EmulationLifecycleDiagnosticField.VulkanInstanceDestroyedCount =>
+                        VulkanRenderer.InstanceDestroyedCount,
+                    EmulationLifecycleDiagnosticField.VulkanSurfaceCreatedCount =>
+                        VulkanRenderer.SurfaceCreatedCount,
+                    EmulationLifecycleDiagnosticField.VulkanSurfaceDestroyedCount =>
+                        VulkanRenderer.SurfaceDestroyedCount,
+                    EmulationLifecycleDiagnosticField.VulkanDeviceCreatedCount =>
+                        VulkanRenderer.DeviceCreatedCount,
+                    EmulationLifecycleDiagnosticField.VulkanDeviceDestroyedCount =>
+                        VulkanRenderer.DeviceDestroyedCount,
+                    EmulationLifecycleDiagnosticField.JitMappingCreatedCount =>
+                        DualMappedJitAllocator.SuccessfulMappingCount,
+                    EmulationLifecycleDiagnosticField.RequiredTeardownMilestoneMask =>
+                        last?.RequiredMilestoneMask ??
+                            EmulationLifecycleDiagnostics.RequiredTeardownMilestones,
+                    EmulationLifecycleDiagnosticField.VulkanValidationErrorCount =>
+                        VulkanRenderer.ValidationErrorCount,
+                    EmulationLifecycleDiagnosticField.VulkanDeviceLostCount =>
+                        VulkanRenderer.DeviceLostCount,
+                    _ => long.MinValue,
+                };
+            }
+            catch
+            {
+                // Diagnostics are read-only and must never throw across the C ABI.
+                return long.MinValue;
             }
         }
 
@@ -369,115 +588,161 @@ namespace Ryujinx.Headless.SDL2
         [UnmanagedCallersOnly(EntryPoint = "set_gamepad_configuration")] 
         unsafe static void setGamepadConfiguration(int argCount, IntPtr* pArgs)
         {
-            ControllerOptions Get(int argCount, IntPtr* pArgs)
+            try
             {
-                string[] args = new string[argCount];
-
-                try
+                ControllerOptions Get(int argCount, IntPtr* pArgs)
                 {
-                    for (int i = 0; i < argCount; i++)
+                    string[] args = new string[argCount];
+
+                    try
                     {
-                        args[i] = Marshal.PtrToStringAnsi(pArgs[i]);
+                        for (int i = 0; i < argCount; i++)
+                        {
+                            args[i] = Marshal.PtrToStringAnsi(pArgs[i]);
 
-                        Console.WriteLine(args[i]);
+                            Console.WriteLine(args[i]);
+                        }
+
+                        ControllerOptions options = null;
+                        Parser.Default.ParseArguments<ControllerOptions>(args)
+                            .WithParsed(option => options = option)
+                            .WithNotParsed(errors => errors.Output());
+                        return options;
                     }
-    
-                    ControllerOptions options = null;
-                    Parser.Default.ParseArguments<ControllerOptions>(args)
-                    .WithParsed(option => options = option)
-                    .WithNotParsed(errors => errors.Output());
-                    return options;
+                    catch (Exception e)
+                    {
+                        Console.WriteLine(e.ToString());
+                        return null;
+                    }
                 }
-                catch (Exception e)
-                {
-                    Console.WriteLine(e.ToString());
-                    return null;
-                }
-            }
 
-
-            ControllerOptions option = Get(argCount, pArgs);
-            if (option == null)
-            {
-                return;
-            }
-
-            static void LoadPlayerConfiguration(string inputProfileName, string inputId, string inputDSUServer, PlayerIndex index, ControllerOptions option)
-            {
-                if (inputId == null)
+                ControllerOptions option = Get(argCount, pArgs);
+                if (option == null)
                 {
                     return;
                 }
 
-                InputConfig inputConfig = HandlePlayerConfiguration(inputProfileName, inputId, inputDSUServer, index, null, option);
-
-                if (inputConfig != null)
+                static void LoadPlayerConfiguration(
+                    List<InputConfig> inputConfiguration,
+                    string inputProfileName,
+                    string inputId,
+                    string inputDSUServer,
+                    PlayerIndex index,
+                    ControllerOptions option)
                 {
-                    _inputConfiguration.Add(inputConfig);
+                    if (inputId == null)
+                    {
+                        return;
+                    }
+
+                    InputConfig inputConfig = HandlePlayerConfiguration(inputProfileName, inputId, inputDSUServer, index, null, option);
+
+                    if (inputConfig != null)
+                    {
+                        inputConfiguration.Add(inputConfig);
+                    }
                 }
+
+                List<InputConfig> inputConfiguration = new();
+
+                LoadPlayerConfiguration(inputConfiguration, null, option.InputId1, null, PlayerIndex.Player1, option);
+                LoadPlayerConfiguration(inputConfiguration, null, option.InputId2, null, PlayerIndex.Player2, option);
+                LoadPlayerConfiguration(inputConfiguration, null, option.InputId3, null, PlayerIndex.Player3, option);
+                LoadPlayerConfiguration(inputConfiguration, null, option.InputId4, null, PlayerIndex.Player4, option);
+                LoadPlayerConfiguration(inputConfiguration, null, option.InputId5, null, PlayerIndex.Player5, option);
+                LoadPlayerConfiguration(inputConfiguration, null, option.InputId6, null, PlayerIndex.Player6, option);
+                LoadPlayerConfiguration(inputConfiguration, null, option.InputId7, null, PlayerIndex.Player7, option);
+                LoadPlayerConfiguration(inputConfiguration, null, option.InputId8, null, PlayerIndex.Player8, option);
+                LoadPlayerConfiguration(inputConfiguration, null, option.InputIdHandheld, null, PlayerIndex.Handheld, option);
+
+                _inputConfiguration = inputConfiguration;
+                Logger.Info?.Print(LogClass.Application, $"Configured {inputConfiguration.Count} gamepads, {inputConfiguration} from native code.");
+
+                Volatile.Read(ref _currentSession)?.TryUseWindow(
+                    window => window.NpadManager?.ReloadConfiguration(inputConfiguration, _enableKeyboard, _enableMouse));
             }
-
-            _inputConfiguration = new List<InputConfig>();
-
-            LoadPlayerConfiguration(null, option.InputId1, null, PlayerIndex.Player1, option);
-            LoadPlayerConfiguration(null, option.InputId2, null, PlayerIndex.Player2, option);
-            LoadPlayerConfiguration(null, option.InputId3, null, PlayerIndex.Player3, option);
-            LoadPlayerConfiguration(null, option.InputId4, null, PlayerIndex.Player4, option);
-            LoadPlayerConfiguration(null, option.InputId5, null, PlayerIndex.Player5, option);
-            LoadPlayerConfiguration(null, option.InputId6, null, PlayerIndex.Player6, option);
-            LoadPlayerConfiguration(null, option.InputId7, null, PlayerIndex.Player7, option);
-            LoadPlayerConfiguration(null, option.InputId8, null, PlayerIndex.Player8, option);
-            LoadPlayerConfiguration(null, option.InputIdHandheld, null, PlayerIndex.Handheld, option);
-
-            Logger.Info?.Print(LogClass.Application, $"Configured {_inputConfiguration.Count} gamepads, {_inputConfiguration} from native code.");
-
-            _window.NpadManager.ReloadConfiguration(_inputConfiguration, _enableKeyboard, _enableMouse);    
+            catch (Exception exception)
+            {
+                // Exceptions must not cross the unmanaged ABI boundary.
+                Logger.Error?.Print(LogClass.Application, $"Failed to update gamepad configuration: {exception}");
+            }
         }
 
 
         [UnmanagedCallersOnly(EntryPoint = "get_current_fps")]
         public static unsafe int GetFPS() 
         {
-            if (_window == null || _window.Device == null)
+            try
             {
-                return 0; 
+                EmulationSession session = Volatile.Read(ref _currentSession);
+
+                return session != null &&
+                    session.TryUseWindow(
+                        window => window.Device == null ? 0 : (int)window.Device.Statistics.GetGameFrameRate(),
+                        out int framesPerSecond)
+                    ? framesPerSecond
+                    : 0;
             }
-
-            Switch Device = _window.Device;
-
-            int intValue = (int)Device.Statistics.GetGameFrameRate(); 
-
-            return intValue;
+            catch (Exception exception)
+            {
+                Logger.Error?.Print(LogClass.Application, $"Failed to get current FPS: {exception}");
+                return 0;
+            }
         }
 
         [UnmanagedCallersOnly(EntryPoint = "set_game_volume")]
-        public static unsafe void SetGameVolume(float volume) {
-            if (_emulationContext == null)
+        public static unsafe void SetGameVolume(float volume)
+        {
+            try
             {
-                return;
+                Volatile.Read(ref _currentSession)?.TryUseEmulationContext(
+                    emulationContext => emulationContext.SetVolume(volume));
             }
-
-            Console.WriteLine($"Set Volume, current: {_emulationContext.GetVolume()}, set to: {volume}");
-
-            _emulationContext.SetVolume(volume);
-
-            Console.WriteLine($"tried to set volume {_emulationContext.GetVolume()}");
+            catch (Exception exception)
+            {
+                Logger.Error?.Print(LogClass.Application, $"Failed to set game volume: {exception}");
+            }
         }
 
         [UnmanagedCallersOnly(EntryPoint = "get_game_volume")]
-        public static unsafe float GetGameVolume() {
-            if (_emulationContext == null)
+        public static unsafe float GetGameVolume()
+        {
+            try
             {
+                EmulationSession session = Volatile.Read(ref _currentSession);
+
+                return session != null &&
+                    session.TryUseEmulationContext(
+                        emulationContext => (float)emulationContext.GetVolume(),
+                        out float volume)
+                    ? volume
+                    : 0;
+            }
+            catch (Exception exception)
+            {
+                Logger.Error?.Print(LogClass.Application, $"Failed to get game volume: {exception}");
                 return 0;
             }
-
-            Console.WriteLine($"Volume gotten: {_emulationContext.GetVolume()} :3");
-
-            return (float)_emulationContext.GetVolume();
         }
 
         [UnmanagedCallersOnly(EntryPoint = "initialize")]
         public static unsafe void Initialize()
+        {
+            try
+            {
+                InitializeCore();
+                Interlocked.Exchange(ref _processInitializationFailure, null);
+            }
+            catch (Exception exception)
+            {
+                Interlocked.Exchange(
+                    ref _processInitializationFailure,
+                    ExceptionDispatchInfo.Capture(exception));
+                LogAbiBoundaryFailure("initialize", exception);
+            }
+        }
+
+        private static void InitializeCore()
         {
             AppDataManager.Initialize(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments));
 
@@ -486,14 +751,7 @@ namespace Ryujinx.Headless.SDL2
                 _virtualFileSystem = VirtualFileSystem.CreateInstance();
             }
 
-            if (_libHacHorizonManager == null)
-            {
-                _libHacHorizonManager = new LibHacHorizonManager();
-                _libHacHorizonManager.InitializeFsServer(_virtualFileSystem);
-                _libHacHorizonManager.InitializeArpServer();
-                _libHacHorizonManager.InitializeBcatServer();
-                _libHacHorizonManager.InitializeSystemClients();
-            }
+            EnsureLibHacHorizonManagerInitialized();
 
             if (_contentManager == null)
             {
@@ -505,13 +763,83 @@ namespace Ryujinx.Headless.SDL2
                 _accountManager = new AccountManager(_libHacHorizonManager.RyujinxClient);
             }
 
-            _inputManager = new InputManager(new SDL2KeyboardDriver(), new NativeGamepadDriver());
+            lock (inputManagerLock)
+            {
+                if (_inputManager == null)
+                {
+                    SDL2KeyboardDriver keyboardDriver = null;
+                    NativeGamepadDriver gamepadDriver = null;
+
+                    try
+                    {
+                        keyboardDriver = new SDL2KeyboardDriver();
+                        gamepadDriver = new NativeGamepadDriver();
+                        _inputManager = new InputManager(keyboardDriver, gamepadDriver);
+                    }
+                    catch
+                    {
+                        gamepadDriver?.Dispose();
+                        keyboardDriver?.Dispose();
+                        throw;
+                    }
+                }
+            }
 
             GCSettings.LatencyMode = GCLatencyMode.Batch;
         }
 
+        private static void EnsureLibHacHorizonManagerInitialized()
+        {
+            lock (horizonManagerLock)
+            {
+                if (_libHacHorizonManager != null)
+                {
+                    return;
+                }
+
+                LibHacHorizonManager manager = new();
+                manager.InitializeFsServer(_virtualFileSystem);
+                manager.InitializeArpServer();
+                manager.InitializeBcatServer();
+                manager.InitializeSystemClients();
+                _libHacHorizonManager = manager;
+            }
+        }
+
         [UnmanagedCallersOnly(EntryPoint = "initialize-dualmapped")]
-        public static unsafe bool InitializeDM() => Cpu.LightningJit.DualMappedTranslator.InitializeDualMapped();
+        public static unsafe bool InitializeDM()
+        {
+            try
+            {
+                return Cpu.LightningJit.DualMappedTranslator.InitializeDualMapped();
+            }
+            catch (Exception exception)
+            {
+                LogAbiBoundaryFailure("initialize-dualmapped", exception);
+                return false;
+            }
+        }
+
+        private static void LogAbiBoundaryFailure(string entrypoint, Exception exception)
+        {
+            try
+            {
+                Logger.Error?.Print(
+                    LogClass.Application,
+                    $"Native entrypoint {entrypoint} failed: {exception}");
+            }
+            catch
+            {
+                try
+                {
+                    Console.Error.WriteLine(
+                        $"Native entrypoint {entrypoint} failed: {exception}");
+                }
+                catch
+                {
+                }
+            }
+        }
 
         static void Main(string[] args)
         {
@@ -527,22 +855,12 @@ namespace Ryujinx.Headless.SDL2
 
             if (OperatingSystem.IsMacOS() || OperatingSystem.IsIOS() || OperatingSystem.IsLinux())
             {
-                AutoResetEvent invoked = new(false);
-
-                // MacOS must perform SDL polls from the main thread.
-                SDL2Driver.MainThreadDispatcher = action =>
+                if (Interlocked.CompareExchange(ref _mainThreadDispatcherRegistered, 1, 0) == 0)
                 {
-                    invoked.Reset();
-
-                    WindowBase.QueueMainThreadAction(() =>
-                    {
-                        action();
-
-                        invoked.Set();
-                    });
-
-                    invoked.WaitOne();
-                };
+                    // MacOS must perform SDL polls from the main thread. Keep one
+                    // process-owned dispatcher and one completion barrier per call.
+                    SDL2Driver.MainThreadDispatcher = DispatchSdlActionToMainThread;
+                }
             }
 
             if (OperatingSystem.IsMacOS())
@@ -553,6 +871,37 @@ namespace Ryujinx.Headless.SDL2
             Parser.Default.ParseArguments<Options>(args)
             .WithParsed(Load)
             .WithNotParsed(errors => errors.Output());
+        }
+
+        private static void DispatchSdlActionToMainThread(Action action)
+        {
+            ArgumentNullException.ThrowIfNull(action);
+
+            using ManualResetEventSlim completed = new(false);
+            ExceptionDispatchInfo failure = null;
+
+            if (!WindowBase.TryQueueMainThreadAction(() =>
+            {
+                try
+                {
+                    action();
+                }
+                catch (Exception exception)
+                {
+                    failure = ExceptionDispatchInfo.Capture(exception);
+                }
+                finally
+                {
+                    completed.Set();
+                }
+            }))
+            {
+                throw new OperationCanceledException(
+                    "The emulation main-thread dispatcher is not accepting work.");
+            }
+
+            completed.Wait();
+            failure?.Throw();
         }
     
         [UnmanagedCallersOnly(EntryPoint = "install_firmware")]
@@ -644,18 +993,83 @@ namespace Ryujinx.Headless.SDL2
         [UnmanagedCallersOnly(EntryPoint = "pause_emulation")]
         public static void PauseEmulation(bool shouldPause)
         {
-            if (_emulationContext != null && _emulationContext.System != null)
+            try
             {
-                _emulationContext.System.TogglePauseEmulation(shouldPause);
+                Volatile.Read(ref _currentSession)?.TryUseEmulationContext(
+                    emulationContext => emulationContext.System?.TogglePauseEmulation(shouldPause));
+            }
+            catch (Exception exception)
+            {
+                Logger.Error?.Print(LogClass.Application, $"Failed to update emulation pause state: {exception}");
+            }
+        }
+
+        [UnmanagedCallersOnly(EntryPoint = "prepare_emulation_start")]
+        public static void PrepareEmulationStart()
+        {
+            if (Volatile.Read(ref _currentSession) != null)
+            {
+                return;
+            }
+
+            Interlocked.Exchange(ref _pendingStopRequest, 0);
+            Volatile.Write(ref _startPending, 1);
+        }
+
+        [UnmanagedCallersOnly(EntryPoint = "cancel_emulation_start")]
+        public static void CancelEmulationStart()
+        {
+            lock (metalLayerLock)
+            {
+                Volatile.Write(ref _startPending, 0);
+                Interlocked.Exchange(ref _pendingStopRequest, 0);
+
+                // Runner rejection means this layer never became session-owned.
+                // A late cancel must not detach a live session's retained layer.
+                if (Volatile.Read(ref _currentSession) == null)
+                {
+                    _pendingNativeMetalLayer = IntPtr.Zero;
+                }
             }
         }
 
         [UnmanagedCallersOnly(EntryPoint = "stop_emulation")]
         public static void StopEmulation()
         {
-            if (_window != null)
+            try
             {
-                _window.Exit();
+                EmulationSession session = Volatile.Read(ref _currentSession);
+
+                if (session != null)
+                {
+                    session.RequestStop();
+                    return;
+                }
+
+                if (Volatile.Read(ref _startPending) == 0)
+                {
+                    return;
+                }
+
+                Interlocked.Exchange(ref _pendingStopRequest, 1);
+                session = Volatile.Read(ref _currentSession);
+
+                if (session != null)
+                {
+                    Interlocked.Exchange(ref _pendingStopRequest, 0);
+                    session.RequestStop();
+                }
+                else if (Volatile.Read(ref _startPending) == 0)
+                {
+                    // The pending start either consumed the request or completed.
+                    // Do not let a late Stop request affect the next session.
+                    Interlocked.Exchange(ref _pendingStopRequest, 0);
+                }
+            }
+            catch (Exception exception)
+            {
+                // Exceptions must not cross the unmanaged ABI boundary.
+                Logger.Error?.Print(LogClass.Application, $"Failed to request emulation stop: {exception}");
             }
         }
 
@@ -1413,11 +1827,15 @@ namespace Ryujinx.Headless.SDL2
 
         static void Load(Options option)
         {
-            _libHacHorizonManager = new LibHacHorizonManager();
-            _libHacHorizonManager.InitializeFsServer(_virtualFileSystem);
-            _libHacHorizonManager.InitializeArpServer();
-            _libHacHorizonManager.InitializeBcatServer();
-            _libHacHorizonManager.InitializeSystemClients();
+            EmulationSession session = Volatile.Read(ref _currentSession)
+                ?? throw new InvalidOperationException("No active emulation session.");
+
+            if (session.IsStopRequested)
+            {
+                return;
+            }
+
+            EnsureLibHacHorizonManagerInitialized();
 
             // _contentManager = new ContentManager(_virtualFileSystem);
 
@@ -1559,18 +1977,10 @@ namespace Ryujinx.Headless.SDL2
                 Logger.Info?.Print(LogClass.Application, $"Increased Memory Limit: {option.MemoryEnt}");
             }
 
-            AppDomain.CurrentDomain.UnhandledException += (sender, e) =>
+            if (Interlocked.CompareExchange(ref _unhandledExceptionHandlerRegistered, 1, 0) == 0)
             {
-                var ex = e.ExceptionObject as Exception;
-                var trace = new System.Diagnostics.StackTrace(ex, true);
-                var frame = trace.GetFrame(0);
-                var file = frame?.GetFileName();
-                var line = frame?.GetFileLineNumber();
-
-                Logger.Info?.Print(LogClass.Application,
-                    $"Unhandled exception: {ex}\nFile: {file}\nLine: {line}");
-
-            };
+                AppDomain.CurrentDomain.UnhandledException += LogUnhandledException;
+            }
 
 
             // Setup graphics configuration
@@ -1584,31 +1994,49 @@ namespace Ryujinx.Headless.SDL2
 
             DriverUtilities.InitDriverConfig(option.BackendThreading == BackendThreading.Off);
             _virtualFileSystem.ReloadKeySet();
-            while (true)
+            while (!session.IsStopRequested)
             {
-                LoadApplication(option);
+                LoadApplication(option, session);
 
-                if (_userChannelPersistence.PreviousIndex == -1 || !_userChannelPersistence.ShouldRestart)
+                if (session.IsStopRequested ||
+                    _userChannelPersistence.PreviousIndex == -1 ||
+                    !_userChannelPersistence.ShouldRestart)
                 {
                     break;
                 }
 
                 _userChannelPersistence.ShouldRestart = false;
-            }
 
-            _inputManager.Dispose();
+                if (!session.TryBeginRestart())
+                {
+                    break;
+                }
+            }
         }
 
-        private static void SetupProgressHandler()
+        private static void LogUnhandledException(object sender, UnhandledExceptionEventArgs eventArgs)
         {
-            if (_emulationContext.Processes.ActiveApplication.DiskCacheLoadState != null)
+            Exception exception = eventArgs.ExceptionObject as Exception;
+            var trace = new System.Diagnostics.StackTrace(exception, true);
+            var frame = trace.GetFrame(0);
+            string file = frame?.GetFileName();
+            int? line = frame?.GetFileLineNumber();
+
+            Logger.Info?.Print(
+                LogClass.Application,
+                $"Unhandled exception: {exception}\nFile: {file}\nLine: {line}");
+        }
+
+        private static void SetupProgressHandler(Switch emulationContext)
+        {
+            if (emulationContext.Processes.ActiveApplication.DiskCacheLoadState != null)
             {
-                _emulationContext.Processes.ActiveApplication.DiskCacheLoadState.StateChanged -= ProgressHandler;
-                _emulationContext.Processes.ActiveApplication.DiskCacheLoadState.StateChanged += ProgressHandler;
+                emulationContext.Processes.ActiveApplication.DiskCacheLoadState.StateChanged -= ProgressHandler;
+                emulationContext.Processes.ActiveApplication.DiskCacheLoadState.StateChanged += ProgressHandler;
             }
 
-            _emulationContext.Gpu.ShaderCacheStateChanged -= ProgressHandler;
-            _emulationContext.Gpu.ShaderCacheStateChanged += ProgressHandler;
+            emulationContext.Gpu.ShaderCacheStateChanged -= ProgressHandler;
+            emulationContext.Gpu.ShaderCacheStateChanged += ProgressHandler;
         }
 
         private static void ProgressHandler<T>(T state, int current, int total) where T : Enum
@@ -1712,8 +2140,6 @@ namespace Ryujinx.Headless.SDL2
         {
             BackendThreading threadingMode = options.BackendThreading;
 
-            renderer = new ThreadedRenderer(renderer);
-
             bool AppleHV = false;
 
             if ((!OperatingSystem.IsIOSVersionAtLeast(16, 4)) && options.UseHypervisor) 
@@ -1760,187 +2186,416 @@ namespace Ryujinx.Headless.SDL2
             return new Switch(configuration);
         }
 
-        private static void ExecutionEntrypoint()
+        private static bool RunCleanupStep(string name, Action action, ref ExceptionDispatchInfo failure)
         {
-            if (OperatingSystem.IsWindows())
+            try
             {
-                _windowsMultimediaTimerResolution = new WindowsMultimediaTimerResolution(1);
+                action();
+                return true;
             }
-
-            DisplaySleep.Prevent();
-
-            _window.Initialize(_emulationContext, _inputConfiguration, _enableKeyboard, _enableMouse);
-
-            _window.Execute();
-
-            _emulationContext.Dispose();
-            _window.Dispose();
-
-            if (OperatingSystem.IsWindows())
+            catch (Exception exception)
             {
-                _windowsMultimediaTimerResolution?.Dispose();
-                _windowsMultimediaTimerResolution = null;
-            }
-        }
-
-        private static bool LoadApplication(Options options)
-        {
-            string path = options.InputPath;
-
-            Logger.RestartTime();
-
-            WindowBase window = CreateWindow(options);
-
-            if (window is MoltenVKWindow mvulkanWindow) {
-                mvulkanWindow.SetNativeWindow(nativeMetalLayer);
-            }
-
-            IRenderer renderer = CreateRenderer(options, window);
-
-            _window = window;
-
-            _window.IsFullscreen = options.IsFullscreen;
-            _window.DisplayId = options.DisplayId;
-            _window.IsExclusiveFullscreen = options.IsExclusiveFullscreen;
-            _window.ExclusiveFullscreenWidth = options.ExclusiveFullscreenWidth;
-            _window.ExclusiveFullscreenHeight = options.ExclusiveFullscreenHeight;
-            _window.AntiAliasing = options.AntiAliasing;
-            _window.ScalingFilter = options.ScalingFilter;
-            _window.ScalingFilterLevel = options.ScalingFilterLevel;
-            renderer.Window?.SetColorSpacePassthrough(true);
-
-
-            _emulationContext = InitializeEmulationContext(window, renderer, options);
-
-            SystemVersion firmwareVersion = _contentManager.GetCurrentFirmwareVersion();
-
-            Logger.Notice.Print(LogClass.Application, $"Using Firmware Version: {firmwareVersion?.VersionString}");
-
-            bool isFirmwareTitle = false;
-
-            if (path.StartsWith("@SystemContent"))
-            {
-                path = VirtualFileSystem.SwitchPathToSystemPath(path);
-
-                isFirmwareTitle = true;
-            }
-
-
-
-            if (Directory.Exists(path))
-            {
-                string[] romFsFiles = Directory.GetFiles(path, "*.istorage");
-
-                if (romFsFiles.Length == 0)
+                if (failure == null)
                 {
-                    romFsFiles = Directory.GetFiles(path, "*.romfs");
-                }
-
-                if (romFsFiles.Length > 0)
-                {
-                    Logger.Info?.Print(LogClass.Application, "Loading as cart with RomFS.");
-
-                    if (!_emulationContext.LoadCart(path, romFsFiles[0]))
-                    {
-                        _emulationContext.Dispose();
-
-                        return false;
-                    }
+                    failure = ExceptionDispatchInfo.Capture(exception);
                 }
                 else
                 {
-                    Logger.Info?.Print(LogClass.Application, "Loading as cart WITHOUT RomFS.");
+                    Logger.Error?.Print(LogClass.Application, $"Additional failure while cleaning up {name}: {exception}");
+                }
 
-                    if (!_emulationContext.LoadCart(path))
+                return false;
+            }
+        }
+
+        private static bool RunGpuCleanupThread(string name, Action action, ref ExceptionDispatchInfo failure)
+        {
+            ExceptionDispatchInfo gpuFailure = null;
+            Thread cleanupThread = new(() =>
+            {
+                Interlocked.Increment(ref WindowBase.ActiveRenderThreadCount);
+
+                try
+                {
+                    action();
+                }
+                catch (Exception exception)
+                {
+                    gpuFailure = ExceptionDispatchInfo.Capture(exception);
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref WindowBase.ActiveRenderThreadCount);
+                }
+            })
+            {
+                Name = "GUI.RenderLoop.Cleanup",
+            };
+
+            bool threadCompleted = RunCleanupStep(name, () =>
+            {
+                cleanupThread.Start();
+                cleanupThread.Join();
+            }, ref failure);
+
+            if (gpuFailure != null)
+            {
+                if (failure == null)
+                {
+                    failure = gpuFailure;
+                }
+                else
+                {
+                    Logger.Error?.Print(LogClass.Application, $"Additional failure while disposing the GPU: {gpuFailure.SourceException}");
+                }
+            }
+
+            return threadCompleted && gpuFailure == null;
+        }
+
+        private static void ShutdownEmulationInstance(
+            EmulationSession session,
+            WindowBase window,
+            Switch emulationContext,
+            IRenderer renderer)
+        {
+            ExceptionDispatchInfo cleanupFailure = null;
+            ExceptionDispatchInfo executionFailure = null;
+            session.MarkStopRequested();
+            session.CloseControlAccess();
+
+            if (window != null)
+            {
+                RunCleanupStep("GPU producer", window.StopAndWaitForGpu, ref cleanupFailure);
+            }
+
+            session.MarkGpuProducerDone();
+
+            if (emulationContext != null)
+            {
+                RunCleanupStep("emulation context", emulationContext.Dispose, ref cleanupFailure);
+            }
+
+            session.MarkSystemDisposed();
+            session.MarkGpuDisposing();
+
+            bool renderJoined = false;
+
+            if (emulationContext != null)
+            {
+                if (window?.Device != null)
+                {
+                    RunCleanupStep("renderer stop", window.RequestRendererStopAfterDrain, ref cleanupFailure);
+                    renderJoined = RunCleanupStep("renderer thread", window.WaitForRendererExit, ref cleanupFailure);
+                    RunCleanupStep("renderer failure propagation", window.ThrowIfRenderFailed, ref executionFailure);
+                    RunCleanupStep(
+                        "renderer GPU disposal",
+                        window.ThrowIfRendererDisposeFailed,
+                        ref cleanupFailure);
+                }
+                else
+                {
+                    renderJoined = RunGpuCleanupThread("GPU cleanup thread", () =>
                     {
-                        _emulationContext.Dispose();
+                        session.LogMilestone("GpuDisposeStart");
+                        emulationContext.DisposeGpu();
+                        session.LogMilestone("GpuDisposed");
+                    }, ref cleanupFailure);
+                }
+            }
+            else if (renderer != null)
+            {
+                renderJoined = RunGpuCleanupThread("unowned renderer", () =>
+                {
+                    session.LogMilestone("GpuDisposeStart");
+                    renderer.Dispose();
+                    session.LogMilestone("GpuDisposed");
+                }, ref cleanupFailure);
+            }
 
-                        return false;
+            if (renderJoined)
+            {
+                session.LogMilestone("RenderJoined");
+            }
+
+            if (window != null)
+            {
+                RunCleanupStep("window", window.Dispose, ref cleanupFailure);
+            }
+
+            RunCleanupStep("display sleep state", DisplaySleep.Restore, ref cleanupFailure);
+            RunCleanupStep("timer resolution", () =>
+            {
+                if (OperatingSystem.IsWindows())
+                {
+                    _windowsMultimediaTimerResolution?.Dispose();
+                }
+
+                _windowsMultimediaTimerResolution = null;
+            }, ref cleanupFailure);
+
+            session.LogMilestone("ApplicationCycleDisposed");
+
+            if (executionFailure != null)
+            {
+                session.RecordFault(executionFailure.SourceException);
+            }
+
+            if (cleanupFailure != null)
+            {
+                session.RecordTeardownFault(cleanupFailure.SourceException);
+                cleanupFailure.Throw();
+            }
+
+            executionFailure?.Throw();
+        }
+
+        private static void ExecutionEntrypoint(
+            EmulationSession session,
+            WindowBase window,
+            Switch emulationContext,
+            IRenderer renderer)
+        {
+            ExceptionDispatchInfo failure = null;
+
+            try
+            {
+                if (!session.IsStopRequested)
+                {
+                    if (OperatingSystem.IsWindows())
+                    {
+                        _windowsMultimediaTimerResolution = new WindowsMultimediaTimerResolution(1);
+                    }
+
+                    DisplaySleep.Prevent();
+
+                    window.Initialize(emulationContext, _inputConfiguration, _enableKeyboard, _enableMouse);
+                    session.MarkRunning();
+
+                    if (!session.IsStopRequested)
+                    {
+                        window.Execute();
                     }
                 }
             }
-            else if (File.Exists(path))
+            catch (OperationCanceledException) when (session.IsStopRequested)
             {
-                switch (Path.GetExtension(path).ToLowerInvariant())
+            }
+            catch (Exception exception)
+            {
+                session.RecordFault(exception);
+                failure = ExceptionDispatchInfo.Capture(exception);
+            }
+            finally
+            {
+                try
                 {
-                    case ".xci":
-                        Logger.Info?.Print(LogClass.Application, "Loading as XCI.");
+                    ShutdownEmulationInstance(session, window, emulationContext, renderer);
+                }
+                catch (Exception exception)
+                {
+                    session.RecordFault(exception);
 
-                        if (!_emulationContext.LoadXci(path))
+                    if (failure == null)
+                    {
+                        failure = ExceptionDispatchInfo.Capture(exception);
+                    }
+                    else
+                    {
+                        Logger.Error?.Print(LogClass.Application, $"Additional failure during emulation shutdown: {exception}");
+                    }
+                }
+            }
+
+            failure?.Throw();
+        }
+
+        private static bool LoadApplication(Options options, EmulationSession session)
+        {
+            string path = options.InputPath;
+            WindowBase window = null;
+            IRenderer renderer = null;
+            Switch emulationContext = null;
+            bool executionOwnsCleanup = false;
+
+            Logger.RestartTime();
+
+            try
+            {
+                try
+                {
+                    window = CreateWindow(options);
+                }
+                catch (WindowConstructionRollbackException exception)
+                {
+                    session.RecordTeardownFault(exception);
+                    throw;
+                }
+
+                session.AttachWindow(window);
+
+                if (window is MoltenVKWindow mvulkanWindow)
+                {
+                    mvulkanWindow.SetNativeWindow(session.GetNativeMetalLayer());
+                }
+
+                renderer = CreateRenderer(options, window);
+                session.TrackRenderer(renderer);
+
+                window.IsFullscreen = options.IsFullscreen;
+                window.DisplayId = options.DisplayId;
+                window.IsExclusiveFullscreen = options.IsExclusiveFullscreen;
+                window.ExclusiveFullscreenWidth = options.ExclusiveFullscreenWidth;
+                window.ExclusiveFullscreenHeight = options.ExclusiveFullscreenHeight;
+                window.AntiAliasing = options.AntiAliasing;
+                window.ScalingFilter = options.ScalingFilter;
+                window.ScalingFilterLevel = options.ScalingFilterLevel;
+                renderer.Window?.SetColorSpacePassthrough(true);
+                renderer = new ThreadedRenderer(renderer);
+                session.TrackRenderer(renderer);
+
+                try
+                {
+                    emulationContext = InitializeEmulationContext(window, renderer, options);
+                }
+                catch (SwitchConstructionRollbackException exception)
+                {
+                    session.RecordTeardownFault(exception);
+                    throw;
+                }
+
+                session.AttachEmulationContext(emulationContext);
+
+                if (session.IsStopRequested)
+                {
+                    return false;
+                }
+
+                SystemVersion firmwareVersion = _contentManager.GetCurrentFirmwareVersion();
+
+                Logger.Notice.Print(LogClass.Application, $"Using Firmware Version: {firmwareVersion?.VersionString}");
+
+                bool isFirmwareTitle = false;
+
+                if (path.StartsWith("@SystemContent"))
+                {
+                    path = VirtualFileSystem.SwitchPathToSystemPath(path);
+
+                    isFirmwareTitle = true;
+                }
+
+                if (Directory.Exists(path))
+                {
+                    string[] romFsFiles = Directory.GetFiles(path, "*.istorage");
+
+                    if (romFsFiles.Length == 0)
+                    {
+                        romFsFiles = Directory.GetFiles(path, "*.romfs");
+                    }
+
+                    if (romFsFiles.Length > 0)
+                    {
+                        Logger.Info?.Print(LogClass.Application, "Loading as cart with RomFS.");
+
+                        if (!emulationContext.LoadCart(path, romFsFiles[0]))
                         {
-                            _emulationContext.Dispose();
-
                             return false;
                         }
-                        break;
-                    case ".nca":
-                        Logger.Info?.Print(LogClass.Application, "Loading as NCA.");
+                    }
+                    else
+                    {
+                        Logger.Info?.Print(LogClass.Application, "Loading as cart WITHOUT RomFS.");
 
-                        if (!_emulationContext.LoadNca(path))
+                        if (!emulationContext.LoadCart(path))
                         {
-                            _emulationContext.Dispose();
-
                             return false;
                         }
-                        break;
-                    case ".nsp":
-                    case ".pfs0":
-                        Logger.Info?.Print(LogClass.Application, "Loading as NSP.");
+                    }
+                }
+                else if (File.Exists(path))
+                {
+                    switch (Path.GetExtension(path).ToLowerInvariant())
+                    {
+                        case ".xci":
+                            Logger.Info?.Print(LogClass.Application, "Loading as XCI.");
 
-                        if (!_emulationContext.LoadNsp(path))
-                        {
-                            _emulationContext.Dispose();
-
-                            return false;
-                        }
-                        break;
-                    default:
-                        if (isFirmwareTitle) {
-                            Logger.Info?.Print(LogClass.Application, "Loading as Firmware Title (NCA).");
-
-                            if (!_emulationContext.LoadNca(path))
+                            if (!emulationContext.LoadXci(path))
                             {
-                                _emulationContext.Dispose();
-
                                 return false;
                             }
-                        }
-                        else {
-                            Logger.Info?.Print(LogClass.Application, "Loading as Homebrew.");
-                            try
+                            break;
+                        case ".nca":
+                            Logger.Info?.Print(LogClass.Application, "Loading as NCA.");
+
+                            if (!emulationContext.LoadNca(path))
                             {
-                                if (!_emulationContext.LoadProgram(path))
+                                return false;
+                            }
+                            break;
+                        case ".nsp":
+                        case ".pfs0":
+                            Logger.Info?.Print(LogClass.Application, "Loading as NSP.");
+
+                            if (!emulationContext.LoadNsp(path))
+                            {
+                                return false;
+                            }
+                            break;
+                        default:
+                            if (isFirmwareTitle)
+                            {
+                                Logger.Info?.Print(LogClass.Application, "Loading as Firmware Title (NCA).");
+
+                                if (!emulationContext.LoadNca(path))
                                 {
-                                    _emulationContext.Dispose();
+                                    return false;
+                                }
+                            }
+                            else
+                            {
+                                Logger.Info?.Print(LogClass.Application, "Loading as Homebrew.");
+                                try
+                                {
+                                    if (!emulationContext.LoadProgram(path))
+                                    {
+                                        return false;
+                                    }
+                                }
+                                catch (ArgumentOutOfRangeException)
+                                {
+                                    Logger.Error?.Print(LogClass.Application, "The specified file is not supported by Ryujinx.");
 
                                     return false;
                                 }
                             }
-                            catch (ArgumentOutOfRangeException)
-                            {
-                                Logger.Error?.Print(LogClass.Application, "The specified file is not supported by Ryujinx.");
+                            break;
+                    }
+                }
+                else
+                {
+                    Logger.Warning?.Print(LogClass.Application, $"Couldn't load '{options.InputPath}'. Please specify a valid XCI/NCA/NSP/PFS0/NRO file.");
 
-                                _emulationContext.Dispose();
+                    return false;
+                }
 
-                                return false;
-                            }
-                        }
-                        break;
+                if (session.IsStopRequested)
+                {
+                    return false;
+                }
+
+                SetupProgressHandler(emulationContext);
+                executionOwnsCleanup = true;
+                ExecutionEntrypoint(session, window, emulationContext, renderer);
+
+                return true;
+            }
+            finally
+            {
+                if (!executionOwnsCleanup)
+                {
+                    ShutdownEmulationInstance(session, window, emulationContext, renderer);
                 }
             }
-            else
-            {
-                Logger.Warning?.Print(LogClass.Application, $"Couldn't load '{options.InputPath}'. Please specify a valid XCI/NCA/NSP/PFS0/NRO file.");
-
-                _emulationContext.Dispose();
-
-                return false;
-            }
-
-            SetupProgressHandler();
-            ExecutionEntrypoint();
-
-            return true;
         }
 
         private static FileStream OpenFile(int descriptor)
@@ -2099,23 +2754,22 @@ namespace Ryujinx.Headless.SDL2
             GraphicsConfig.EnableTextureRecompression = options.EnableTextureRecompression;
             GraphicsConfig.EnableMacroHLE = !options.DisableMacroHLE;
 
-            if (_emulationContext != null)
+            Volatile.Read(ref _currentSession)?.TryUseEmulationContext(emulationContext =>
             {
-                _emulationContext.SetVolume(options.AudioVolume);
-
-                _emulationContext.System.State.SetLanguage(options.SystemLanguage);
-                _emulationContext.System.State.SetRegion(options.SystemRegion);
-                _emulationContext.EnableDeviceVsync = !options.DisableVSync;
-                _emulationContext.System.State.DockedMode = !options.DisableDockedMode;
-                _emulationContext.System.EnablePtc = !options.DisablePTC;
-                _emulationContext.System.FsIntegrityCheckLevel = !options.DisableFsIntegrityChecks ? IntegrityCheckLevel.ErrorOnInvalid : IntegrityCheckLevel.None;
-                _emulationContext.System.GlobalAccessLogMode = options.FsGlobalAccessLogMode;
-                _emulationContext.Configuration.IgnoreMissingServices = options.IgnoreMissingServices;
-                _emulationContext.Configuration.AspectRatio = options.AspectRatio;
-                _emulationContext.Configuration.EnableInternetAccess = options.EnableInternetAccess;
-                _emulationContext.Configuration.MemoryManagerMode = options.MemoryManagerMode;
-                _emulationContext.Configuration.MultiplayerLanInterfaceId = options.MultiplayerLanInterfaceId;
-            }
+                emulationContext.SetVolume(options.AudioVolume);
+                emulationContext.System.State.SetLanguage(options.SystemLanguage);
+                emulationContext.System.State.SetRegion(options.SystemRegion);
+                emulationContext.EnableDeviceVsync = !options.DisableVSync;
+                emulationContext.System.State.DockedMode = !options.DisableDockedMode;
+                emulationContext.System.EnablePtc = !options.DisablePTC;
+                emulationContext.System.FsIntegrityCheckLevel = !options.DisableFsIntegrityChecks ? IntegrityCheckLevel.ErrorOnInvalid : IntegrityCheckLevel.None;
+                emulationContext.System.GlobalAccessLogMode = options.FsGlobalAccessLogMode;
+                emulationContext.Configuration.IgnoreMissingServices = options.IgnoreMissingServices;
+                emulationContext.Configuration.AspectRatio = options.AspectRatio;
+                emulationContext.Configuration.EnableInternetAccess = options.EnableInternetAccess;
+                emulationContext.Configuration.MemoryManagerMode = options.MemoryManagerMode;
+                emulationContext.Configuration.MultiplayerLanInterfaceId = options.MultiplayerLanInterfaceId;
+            });
         }
     }
 

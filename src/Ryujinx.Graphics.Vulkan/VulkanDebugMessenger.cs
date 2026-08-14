@@ -5,17 +5,22 @@ using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.EXT;
 using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace Ryujinx.Graphics.Vulkan
 {
     class VulkanDebugMessenger : IDisposable
     {
+        private static long _validationErrorCount;
+
         private readonly Vk _api;
         private readonly Instance _instance;
         private readonly GraphicsDebugLevel _logLevel;
         private readonly ExtDebugUtils _debugUtils;
         private readonly DebugUtilsMessengerEXT? _debugUtilsMessenger;
         private bool _disposed;
+
+        public static long ValidationErrorCount => Interlocked.Read(ref _validationErrorCount);
 
         public VulkanDebugMessenger(Vk api, Instance instance, GraphicsDebugLevel logLevel)
         {
@@ -99,6 +104,11 @@ namespace Ryujinx.Graphics.Vulkan
 
             if (messageSeverity.HasFlag(DebugUtilsMessageSeverityFlagsEXT.ErrorBitExt))
             {
+                if (messageTypes.HasFlag(DebugUtilsMessageTypeFlagsEXT.ValidationBitExt))
+                {
+                    Interlocked.Increment(ref _validationErrorCount);
+                }
+
                 Logger.Error?.Print(LogClass.Gpu, msg);
             }
             else if (messageSeverity.HasFlag(DebugUtilsMessageSeverityFlagsEXT.WarningBitExt))

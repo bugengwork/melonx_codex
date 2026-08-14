@@ -45,30 +45,33 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
-	<key>NSBonjourServices</key>
-	<array>
-		<string>_melonx-ctrl._tcp</string>
-	</array>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>MeloNX uses the local network to connect an iPhone as a controller for a nearby iPad.</string>
 	<key>NSUserActivityTypes</key>
 	<array>
 		<string>LaunchGameIntent</string>
 	</array>
-	<key>WiFiAwareServices</key>
-	<dict>
-		<key>_melonx-ctrl._tcp</key>
-		<dict>
-			<key>Publishable</key>
-			<dict/>
-			<key>Subscribable</key>
-			<dict/>
-		</dict>
-	</dict>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
 		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneConfigurationName</key>
+					<string>Default Configuration</string>
+					<key>UISceneDelegateClassName</key>
+					<string>$(PRODUCT_MODULE_NAME).SceneDelegate</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UIColorName</key>
+		<string>LaunchBackground</string>
+		<key>UIImageName</key>
+		<string>LaunchLogo</string>
 	</dict>
 	<key>UIBackgroundModes</key>
 	<array>

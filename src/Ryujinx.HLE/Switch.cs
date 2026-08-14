@@ -2,6 +2,8 @@ using Ryujinx.Audio.Backends.CompatLayer;
 using Ryujinx.Audio.Backends.DelayLayer;
 using Ryujinx.Audio.Integration;
 using Ryujinx.Common.Configuration;
+using Ryujinx.Common.Logging;
+using Ryujinx.Graphics.GAL.Multithreading;
 using Ryujinx.Graphics.Gpu;
 using Ryujinx.HLE.FileSystem;
 using Ryujinx.HLE.HOS;
@@ -11,9 +13,36 @@ using Ryujinx.HLE.Loaders.Processes;
 using Ryujinx.HLE.UI;
 using Ryujinx.Memory;
 using System;
+using System.Collections.Generic;
+using System.Runtime.ExceptionServices;
+using System.Threading;
 
 namespace Ryujinx.HLE
 {
+    public sealed class SwitchConstructionRollbackException : AggregateException
+    {
+        public SwitchConstructionRollbackException(
+            Exception constructionFailure,
+            IReadOnlyCollection<Exception> rollbackFailures)
+            : base(
+                "Switch construction failed and its rollback did not complete.",
+                CombineFailures(constructionFailure, rollbackFailures))
+        {
+        }
+
+        private static IEnumerable<Exception> CombineFailures(
+            Exception constructionFailure,
+            IReadOnlyCollection<Exception> rollbackFailures)
+        {
+            yield return constructionFailure;
+
+            foreach (Exception rollbackFailure in rollbackFailures)
+            {
+                yield return rollbackFailure;
+            }
+        }
+    }
+
     public class Switch : IDisposable
     {
         public HLEConfiguration Configuration { get; }
@@ -32,6 +61,8 @@ namespace Ryujinx.HLE
 
         public bool IsFrameAvailable => Gpu.Window.IsFrameAvailable;
 
+        private int _disposeState;
+
         public Switch(HLEConfiguration configuration)
         {
             ArgumentNullException.ThrowIfNull(configuration.GpuRenderer);
@@ -46,27 +77,79 @@ namespace Ryujinx.HLE
                 ? MemoryAllocationFlags.Reserve
                 : MemoryAllocationFlags.Reserve; //  | MemoryAllocationFlags.Mirrorable;
 
+            try
+            {
 #pragma warning disable IDE0055 // Disable formatting
-            AudioDeviceDriver = AddAudioCompatLayers(Configuration.AudioDeviceDriver);
-            Memory            = new MemoryBlock(Configuration.MemoryConfiguration.ToDramSize(), memoryAllocationFlags);
-            Gpu               = new GpuContext(Configuration.GpuRenderer);
-            System            = new HOS.Horizon(this);
-            Statistics        = new PerformanceStatistics();
-            Hid               = new Hid(this, System.HidStorage);
-            Processes         = new ProcessLoader(this);
-            TamperMachine     = new TamperMachine();
+                AudioDeviceDriver = AddAudioCompatLayers(Configuration.AudioDeviceDriver);
+                Memory            = new MemoryBlock(Configuration.MemoryConfiguration.ToDramSize(), memoryAllocationFlags);
+                Gpu               = new GpuContext(Configuration.GpuRenderer);
+                System            = new HOS.Horizon(this);
+                Statistics        = new PerformanceStatistics();
+                Hid               = new Hid(this, System.HidStorage);
+                Processes         = new ProcessLoader(this);
+                TamperMachine     = new TamperMachine();
 
-            System.InitializeServices();
-            System.State.SetLanguage(Configuration.SystemLanguage);
-            System.State.SetRegion(Configuration.Region);
+                System.InitializeServices();
+                System.State.SetLanguage(Configuration.SystemLanguage);
+                System.State.SetRegion(Configuration.Region);
 
-            EnableDeviceVsync                       = Configuration.EnableVsync;
-            System.State.DockedMode                 = Configuration.EnableDockedMode;
-            System.PerformanceState.PerformanceMode = System.State.DockedMode ? PerformanceMode.Boost : PerformanceMode.Default;
-            System.EnablePtc                        = Configuration.EnablePtc;
-            System.FsIntegrityCheckLevel            = Configuration.FsIntegrityCheckLevel;
-            System.GlobalAccessLogMode              = Configuration.FsGlobalAccessLogMode;
+                EnableDeviceVsync                       = Configuration.EnableVsync;
+                System.State.DockedMode                 = Configuration.EnableDockedMode;
+                System.PerformanceState.PerformanceMode = System.State.DockedMode ? PerformanceMode.Boost : PerformanceMode.Default;
+                System.EnablePtc                        = Configuration.EnablePtc;
+                System.FsIntegrityCheckLevel            = Configuration.FsIntegrityCheckLevel;
+                System.GlobalAccessLogMode              = Configuration.FsGlobalAccessLogMode;
 #pragma warning restore IDE0055
+            }
+            catch (Exception constructionFailure)
+            {
+                List<Exception> rollbackFailures = new();
+
+                // Preserve the construction failure while still attempting every cleanup step.
+                DisposeAfterConstructionFailure(System, nameof(System), rollbackFailures);
+                DisposeAfterConstructionFailure(Gpu, nameof(Gpu), rollbackFailures);
+                DisposeAfterConstructionFailure(Memory, nameof(Memory), rollbackFailures);
+                DisposeAfterConstructionFailure(
+                    AudioDeviceDriver ?? Configuration.AudioDeviceDriver,
+                    nameof(AudioDeviceDriver),
+                    rollbackFailures);
+                DisposeAfterConstructionFailure(FileSystem, nameof(FileSystem), rollbackFailures);
+
+                if (rollbackFailures.Count != 0)
+                {
+                    throw new SwitchConstructionRollbackException(
+                        constructionFailure,
+                        rollbackFailures);
+                }
+
+                throw;
+            }
+        }
+
+        private static void DisposeAfterConstructionFailure(
+            IDisposable resource,
+            string resourceName,
+            List<Exception> rollbackFailures)
+        {
+            try
+            {
+                resource?.Dispose();
+            }
+            catch (Exception exception)
+            {
+                rollbackFailures.Add(exception);
+
+                try
+                {
+                    Logger.Error?.Print(
+                        LogClass.Application,
+                        $"Failed to dispose {resourceName} after Switch construction failed: {exception}");
+                }
+                catch
+                {
+                    // Cleanup and logging failures must not replace the construction failure.
+                }
+            }
         }
 
         private IHardwareDeviceDriver AddAudioCompatLayers(IHardwareDeviceDriver driver)
@@ -162,12 +245,39 @@ namespace Ryujinx.HLE
 
         protected virtual void Dispose(bool disposing)
         {
-            if (disposing)
+            if (!disposing || Interlocked.Exchange(ref _disposeState, 1) != 0)
             {
-                System.Dispose();
-                AudioDeviceDriver.Dispose();
-                FileSystem.Dispose();
-                Memory.Dispose();
+                return;
+            }
+
+            ExceptionDispatchInfo firstException = null;
+
+            if (Gpu?.Renderer is ThreadedRenderer threadedRenderer)
+            {
+                CaptureDisposeException(
+                    () => threadedRenderer.TryTakeBackendThreadOwnership(),
+                    ref firstException);
+            }
+
+            CaptureDisposeException(System.Dispose, ref firstException);
+            CaptureDisposeException(AudioDeviceDriver.Dispose, ref firstException);
+            CaptureDisposeException(FileSystem.Dispose, ref firstException);
+            CaptureDisposeException(Memory.Dispose, ref firstException);
+
+            firstException?.Throw();
+        }
+
+        private static void CaptureDisposeException(
+            Action dispose,
+            ref ExceptionDispatchInfo firstException)
+        {
+            try
+            {
+                dispose();
+            }
+            catch (Exception exception)
+            {
+                firstException ??= ExceptionDispatchInfo.Capture(exception);
             }
         }
     }

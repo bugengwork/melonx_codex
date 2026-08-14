@@ -21,6 +21,7 @@ struct EmulationView: View {
     @AppStorage("OldView") var oldView = true
     @State var isPresentedThree: Bool = false
     @State var isAirplaying = Air.shared.connected
+    @State private var airConnectionCallbackToken: Air.ConnectionCallbackToken?
     
     @Environment(\.scenePhase) var scenePhase
     @State private var isInBackground = false
@@ -94,6 +95,25 @@ struct EmulationView: View {
                 }
                 .allowsHitTesting(false)
             }
+
+            if ryujinx.state == .stopping || ryujinx.state == .failed {
+                Color.black.opacity(0.65)
+                    .ignoresSafeArea()
+
+                VStack(spacing: 12) {
+                    if ryujinx.state == .stopping {
+                        ProgressView()
+                            .tint(.white)
+                        Text("Stopping emulation…")
+                    } else {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                        Text("Cleanup did not finish. Restart MeloNX before launching another game.")
+                    }
+                }
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.white)
+                .padding()
+            }
         }
         .overlay(alignment: .topTrailing) {
             if ProcessInfo.processInfo.isLowPowerModeEnabled {
@@ -109,8 +129,9 @@ struct EmulationView: View {
             }
             
             // LocationManager.sharedInstance.startUpdatingLocation()
-            if !ProcessInfo.processInfo.isiOSAppOnMac {
-                Air.shared.connectionCallbacks.append { cool in
+            if !ProcessInfo.processInfo.isiOSAppOnMac,
+               airConnectionCallbackToken == nil {
+                airConnectionCallbackToken = Air.connection { cool in
                     Task { @MainActor in
                         isAirplaying = cool
                     }
@@ -122,6 +143,12 @@ struct EmulationView: View {
                     print(cool)
                     self.stop()
                 }
+            }
+        }
+        .onDisappear {
+            if let token = airConnectionCallbackToken {
+                Air.removeConnectionCallback(token)
+                airConnectionCallbackToken = nil
             }
         }
         .statusBar(hidden: true)
@@ -141,6 +168,12 @@ struct EmulationView: View {
                 RyujinxBridge.pauseEmulation(true)
                 isInBackground = true
                 pauseEmu = true
+            }
+        }
+        .onChange(of: ryujinx.state) { newState in
+            if newState == .idle {
+                gameHandler.showApp = true
+                gameHandler.currentGame = nil
             }
         }
         .sheet(isPresented: $showControllerSettings) {
@@ -294,12 +327,7 @@ struct EmulationView: View {
     
     
     func stop() {
-        gameHandler.showApp = true
-        Timer.scheduledTimer(withTimeInterval: 0.2, repeats: false) { _ in
-            gameHandler.currentGame = nil
-            RyujinxBridge.stopEmulation()
-            try? ryujinx.stop()
-        }
+        try? ryujinx.stop()
     }
     
     func nextAspectRatio(current: AspectRatio) -> AspectRatio {

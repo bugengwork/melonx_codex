@@ -39,6 +39,8 @@ class RumbleController {
     deinit {
         playerRestartTimer?.invalidate() // Stop the timer
         playerRestartTimer = nil
+        durationTimer?.invalidate()
+        durationTimer = nil
         
         // Optionally stop the haptic players immediately
         try? lowHapticPlayer?.stop(atTime: CHHapticTimeImmediate)

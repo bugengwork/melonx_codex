@@ -7,6 +7,7 @@
 
 import SwiftUI
 
+@MainActor
 protocol PerGameSettingsManaging: ObservableObject {
     var config: [String: Ryujinx.Arguments] { get set }
     
@@ -19,6 +20,7 @@ protocol PerGameSettingsManaging: ObservableObject {
 
 
 
+@MainActor
 class PerGameSettingsManager: PerGameSettingsManaging {
     @Published var config: [String: Ryujinx.Arguments] {
         didSet {
@@ -93,7 +95,13 @@ struct PerGameSettingsView: View {
     
     var titleId: String
 
-    init(titleId: String, manager: any PerGameSettingsManaging = PerGameSettingsManager.shared) {
+    @MainActor
+    init(titleId: String) {
+        self.init(titleId: titleId, manager: PerGameSettingsManager.shared)
+    }
+
+    @MainActor
+    init(titleId: String, manager: any PerGameSettingsManaging) {
         self._settingsManager = StateObject(wrappedValue: manager as! PerGameSettingsManager)
         self.titleId = titleId 
     }

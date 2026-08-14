@@ -13,10 +13,19 @@ class MeloMTKView: MTKView {
     private var ignoredTouches: Set<UITouch> = []
 
     private var aspectRatio: AspectRatio = .fixed16x9
+    private var reportedViewWidth = -1
+    private var reportedViewHeight = -1
 
     func setAspectRatio(_ ratio: AspectRatio) {
         self.aspectRatio = ratio
-        RyujinxBridge.setViewSize(width: Int(self.bounds.width), height: Int(self.bounds.height))
+
+        let width = Int(bounds.width)
+        let height = Int(bounds.height)
+        guard width != reportedViewWidth || height != reportedViewHeight else { return }
+
+        reportedViewWidth = width
+        reportedViewHeight = height
+        RyujinxBridge.setViewSize(width: width, height: height)
     }
     
     private func transformToTargetCoordinates(_ point: CGPoint) -> CGPoint {
@@ -39,7 +48,6 @@ class MeloMTKView: MTKView {
             let location = touch.location(in: self)
             let index = getNextAvailableIndex()
             activeTouches.append(touch)
-            print("Touch location: \(location)")
             let transformed = transformToTargetCoordinates(location)
             RyujinxBridge.touchBegan(x: Float(transformed.x), y: Float(transformed.y), index: index)
         }
@@ -131,4 +139,3 @@ class MeloMTKView: MTKView {
         ignoredTouches.removeAll()
     }
 }
-

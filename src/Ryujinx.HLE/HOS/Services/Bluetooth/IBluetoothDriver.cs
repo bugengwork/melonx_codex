@@ -24,75 +24,78 @@ namespace Ryujinx.HLE.HOS.Services.Bluetooth
 
             int initializeEventHandle;
 
-            if ((bool)debugMode)
+            lock (BluetoothEventManager.SyncRoot)
             {
-                if (BluetoothEventManager.InitializeBleDebugEventHandle == 0)
+                if ((bool)debugMode)
                 {
-                    BluetoothEventManager.InitializeBleDebugEvent = new KEvent(context.Device.System.KernelContext);
-
-                    if (context.Process.HandleTable.GenerateHandle(BluetoothEventManager.InitializeBleDebugEvent.ReadableEvent, out BluetoothEventManager.InitializeBleDebugEventHandle) != Result.Success)
+                    if (BluetoothEventManager.InitializeBleDebugEventHandle == 0)
                     {
-                        throw new InvalidOperationException("Out of handles!");
-                    }
-                }
+                        BluetoothEventManager.InitializeBleDebugEvent = new KEvent(context.Device.System.KernelContext);
 
-                if (BluetoothEventManager.UnknownBleDebugEventHandle == 0)
+                        if (context.Process.HandleTable.GenerateHandle(BluetoothEventManager.InitializeBleDebugEvent.ReadableEvent, out BluetoothEventManager.InitializeBleDebugEventHandle) != Result.Success)
+                        {
+                            throw new InvalidOperationException("Out of handles!");
+                        }
+                    }
+
+                    if (BluetoothEventManager.UnknownBleDebugEventHandle == 0)
+                    {
+                        BluetoothEventManager.UnknownBleDebugEvent = new KEvent(context.Device.System.KernelContext);
+
+                        if (context.Process.HandleTable.GenerateHandle(BluetoothEventManager.UnknownBleDebugEvent.ReadableEvent, out BluetoothEventManager.UnknownBleDebugEventHandle) != Result.Success)
+                        {
+                            throw new InvalidOperationException("Out of handles!");
+                        }
+                    }
+
+                    if (BluetoothEventManager.RegisterBleDebugEventHandle == 0)
+                    {
+                        BluetoothEventManager.RegisterBleDebugEvent = new KEvent(context.Device.System.KernelContext);
+
+                        if (context.Process.HandleTable.GenerateHandle(BluetoothEventManager.RegisterBleDebugEvent.ReadableEvent, out BluetoothEventManager.RegisterBleDebugEventHandle) != Result.Success)
+                        {
+                            throw new InvalidOperationException("Out of handles!");
+                        }
+                    }
+
+                    initializeEventHandle = BluetoothEventManager.InitializeBleDebugEventHandle;
+                }
+                else
                 {
-                    BluetoothEventManager.UnknownBleDebugEvent = new KEvent(context.Device.System.KernelContext);
+                    _unknownLowEnergy = "low_energy";
 
-                    if (context.Process.HandleTable.GenerateHandle(BluetoothEventManager.UnknownBleDebugEvent.ReadableEvent, out BluetoothEventManager.UnknownBleDebugEventHandle) != Result.Success)
+                    if (BluetoothEventManager.InitializeBleEventHandle == 0)
                     {
-                        throw new InvalidOperationException("Out of handles!");
+                        BluetoothEventManager.InitializeBleEvent = new KEvent(context.Device.System.KernelContext);
+
+                        if (context.Process.HandleTable.GenerateHandle(BluetoothEventManager.InitializeBleEvent.ReadableEvent, out BluetoothEventManager.InitializeBleEventHandle) != Result.Success)
+                        {
+                            throw new InvalidOperationException("Out of handles!");
+                        }
                     }
-                }
 
-                if (BluetoothEventManager.RegisterBleDebugEventHandle == 0)
-                {
-                    BluetoothEventManager.RegisterBleDebugEvent = new KEvent(context.Device.System.KernelContext);
-
-                    if (context.Process.HandleTable.GenerateHandle(BluetoothEventManager.RegisterBleDebugEvent.ReadableEvent, out BluetoothEventManager.RegisterBleDebugEventHandle) != Result.Success)
+                    if (BluetoothEventManager.UnknownBleEventHandle == 0)
                     {
-                        throw new InvalidOperationException("Out of handles!");
+                        BluetoothEventManager.UnknownBleEvent = new KEvent(context.Device.System.KernelContext);
+
+                        if (context.Process.HandleTable.GenerateHandle(BluetoothEventManager.UnknownBleEvent.ReadableEvent, out BluetoothEventManager.UnknownBleEventHandle) != Result.Success)
+                        {
+                            throw new InvalidOperationException("Out of handles!");
+                        }
                     }
-                }
 
-                initializeEventHandle = BluetoothEventManager.InitializeBleDebugEventHandle;
-            }
-            else
-            {
-                _unknownLowEnergy = "low_energy";
-
-                if (BluetoothEventManager.InitializeBleEventHandle == 0)
-                {
-                    BluetoothEventManager.InitializeBleEvent = new KEvent(context.Device.System.KernelContext);
-
-                    if (context.Process.HandleTable.GenerateHandle(BluetoothEventManager.InitializeBleEvent.ReadableEvent, out BluetoothEventManager.InitializeBleEventHandle) != Result.Success)
+                    if (BluetoothEventManager.RegisterBleEventHandle == 0)
                     {
-                        throw new InvalidOperationException("Out of handles!");
+                        BluetoothEventManager.RegisterBleEvent = new KEvent(context.Device.System.KernelContext);
+
+                        if (context.Process.HandleTable.GenerateHandle(BluetoothEventManager.RegisterBleEvent.ReadableEvent, out BluetoothEventManager.RegisterBleEventHandle) != Result.Success)
+                        {
+                            throw new InvalidOperationException("Out of handles!");
+                        }
                     }
+
+                    initializeEventHandle = BluetoothEventManager.InitializeBleEventHandle;
                 }
-
-                if (BluetoothEventManager.UnknownBleEventHandle == 0)
-                {
-                    BluetoothEventManager.UnknownBleEvent = new KEvent(context.Device.System.KernelContext);
-
-                    if (context.Process.HandleTable.GenerateHandle(BluetoothEventManager.UnknownBleEvent.ReadableEvent, out BluetoothEventManager.UnknownBleEventHandle) != Result.Success)
-                    {
-                        throw new InvalidOperationException("Out of handles!");
-                    }
-                }
-
-                if (BluetoothEventManager.RegisterBleEventHandle == 0)
-                {
-                    BluetoothEventManager.RegisterBleEvent = new KEvent(context.Device.System.KernelContext);
-
-                    if (context.Process.HandleTable.GenerateHandle(BluetoothEventManager.RegisterBleEvent.ReadableEvent, out BluetoothEventManager.RegisterBleEventHandle) != Result.Success)
-                    {
-                        throw new InvalidOperationException("Out of handles!");
-                    }
-                }
-
-                initializeEventHandle = BluetoothEventManager.InitializeBleEventHandle;
             }
 
             context.Response.HandleDesc = IpcHandleDesc.MakeCopy(initializeEventHandle);

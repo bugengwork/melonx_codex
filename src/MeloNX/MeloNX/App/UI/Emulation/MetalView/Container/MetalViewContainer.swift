@@ -66,6 +66,7 @@ struct MetalViewContainer: View {
 
 
 
+@MainActor
 func targetSize(for containerSize: CGSize? = nil, ryujinx: Ryujinx) -> CGSize {
     var targetAspect: CGFloat
     
@@ -114,5 +115,4 @@ func isScreenAspectRatio(_ targetWidth: CGFloat, _ targetHeight: CGFloat, tolera
 
     return abs(actualRatio - targetRatio) < tolerance
 }
-
 

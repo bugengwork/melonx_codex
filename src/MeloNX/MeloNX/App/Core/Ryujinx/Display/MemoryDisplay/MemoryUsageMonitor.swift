@@ -14,8 +14,19 @@ class MemoryUsageMonitor: ObservableObject {
     private var task: Task<Void, Never>?
 
     init() {
-        task = Task {
-            await monitorMemoryUsage()
+        task = Task.detached(priority: .utility) { [weak self] in
+            while !Task.isCancelled {
+                let memoryUsage = Self.currentPhysicalFootprint() ?? 0
+
+                await MainActor.run { [weak self] in
+                    self?.memoryUsage = memoryUsage
+                }
+
+                // A memory label does not benefit from 5 Hz refresh. Sampling at
+                // 1 Hz cuts task_info calls and main-actor publications by 80%
+                // while remaining responsive enough for human-readable telemetry.
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
         }
     }
 
@@ -23,14 +34,7 @@ class MemoryUsageMonitor: ObservableObject {
         task?.cancel()
     }
 
-    private func monitorMemoryUsage() async {
-        while !Task.isCancelled {
-            updateMemoryUsage()
-            try? await Task.sleep(nanoseconds: 200_000_000) 
-        }
-    }
-
-    private func updateMemoryUsage() {
+    nonisolated static func currentPhysicalFootprint() -> UInt64? {
         var taskInfo = task_vm_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.stride) / 4
 
@@ -41,11 +45,17 @@ class MemoryUsageMonitor: ObservableObject {
         }
 
         if result == KERN_SUCCESS {
-            memoryUsage = taskInfo.phys_footprint
-        } else {
-            print("Failed to get memory usage: \(result)")
-            memoryUsage = 0
+            return taskInfo.phys_footprint
         }
+
+        print("[EmulationLifecycle] Failed to read phys_footprint: \(result)")
+        return nil
+    }
+
+    nonisolated static func logPhysicalFootprint(sessionID: UUID?, stage: String) {
+        let session = sessionID?.uuidString ?? "none"
+        let bytes = currentPhysicalFootprint() ?? 0
+        print("[EmulationLifecycle] session=\(session) stage=\(stage) phys_footprint=\(bytes)")
     }
 
     func formatMemorySize(_ bytes: UInt64) -> String {

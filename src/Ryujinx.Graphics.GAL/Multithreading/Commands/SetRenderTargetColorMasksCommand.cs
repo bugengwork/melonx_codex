@@ -16,8 +16,15 @@ namespace Ryujinx.Graphics.GAL.Multithreading.Commands
         public static void Run(ref SetRenderTargetColorMasksCommand command, ThreadedRenderer threaded, IRenderer renderer)
         {
             ReadOnlySpan<uint> componentMask = command._componentMask.Get(threaded);
-            renderer.Pipeline.SetRenderTargetColorMasks(componentMask);
-            command._componentMask.Dispose(threaded);
+
+            try
+            {
+                renderer.Pipeline.SetRenderTargetColorMasks(componentMask);
+            }
+            finally
+            {
+                command._componentMask.Dispose(threaded);
+            }
         }
     }
 }

@@ -18,8 +18,17 @@ namespace Ryujinx.Graphics.GAL.Multithreading.Commands.Renderer
         public static void Run(ref CreateBufferSparseCommand command, ThreadedRenderer threaded, IRenderer renderer)
         {
             Span<BufferRange> buffers = command._buffers.Get(threaded);
-            threaded.Buffers.AssignBuffer(command._threadedHandle, renderer.CreateBufferSparse(threaded.Buffers.MapBufferRanges(buffers)));
-            command._buffers.Dispose(threaded);
+
+            try
+            {
+                threaded.Buffers.AssignBuffer(
+                    command._threadedHandle,
+                    renderer.CreateBufferSparse(threaded.Buffers.MapBufferRanges(buffers)));
+            }
+            finally
+            {
+                command._buffers.Dispose(threaded);
+            }
         }
     }
 }

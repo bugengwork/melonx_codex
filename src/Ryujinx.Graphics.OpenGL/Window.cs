@@ -4,6 +4,7 @@ using Ryujinx.Graphics.OpenGL.Effects;
 using Ryujinx.Graphics.OpenGL.Effects.Smaa;
 using Ryujinx.Graphics.OpenGL.Image;
 using System;
+using System.Runtime.ExceptionServices;
 
 namespace Ryujinx.Graphics.OpenGL
 {
@@ -269,18 +270,43 @@ namespace Ryujinx.Graphics.OpenGL
                 return;
             }
 
-            BackgroundContext.Dispose();
+            _initialized = false;
+            ExceptionDispatchInfo firstException = null;
 
-            if (_copyFramebufferHandle != 0)
+            CaptureDisposeException(
+                () => BackgroundContext?.Dispose(),
+                ref firstException);
+
+            CaptureDisposeException(
+                () =>
+                {
+                    if (_copyFramebufferHandle != 0)
+                    {
+                        GL.DeleteFramebuffer(_copyFramebufferHandle);
+                        _copyFramebufferHandle = 0;
+                    }
+                },
+                ref firstException);
+
+            CaptureDisposeException(() => _antiAliasing?.Dispose(), ref firstException);
+            CaptureDisposeException(() => _scalingFilter?.Dispose(), ref firstException);
+            CaptureDisposeException(() => _upscaledTexture?.Dispose(), ref firstException);
+
+            firstException?.Throw();
+        }
+
+        private static void CaptureDisposeException(
+            Action dispose,
+            ref ExceptionDispatchInfo firstException)
+        {
+            try
             {
-                GL.DeleteFramebuffer(_copyFramebufferHandle);
-
-                _copyFramebufferHandle = 0;
+                dispose();
             }
-
-            _antiAliasing?.Dispose();
-            _scalingFilter?.Dispose();
-            _upscaledTexture?.Dispose();
+            catch (Exception exception)
+            {
+                firstException ??= ExceptionDispatchInfo.Capture(exception);
+            }
         }
 
         public void SetAntiAliasing(AntiAliasing effect)

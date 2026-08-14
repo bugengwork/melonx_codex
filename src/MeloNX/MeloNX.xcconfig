@@ -10,9 +10,9 @@
 
 VERSION = 2.3
 
-DEVELOPMENT_TEAM[config=Archive] = XYZ0123456
-PRODUCT_BUNDLE_IDENTIFIER[config=Archive] = com.stossy11.MeloNX
+DEVELOPMENT_TEAM[config=Archive] = XC4757DJPM
+PRODUCT_BUNDLE_IDENTIFIER[config=Archive] = com.xc4757djpm.melonx
 CODE_SIGN_IDENTITY[config=Archive]  = -
-DEVELOPMENT_TEAM[config=Archive] = XYZ0123456
+DEVELOPMENT_TEAM[config=Archive] = XC4757DJPM
 CODE_SIGN_STYLE[config=Archive] = Manual
 AD_HOC_CODE_SIGNING_ALLOWED[config=Archive] = YES

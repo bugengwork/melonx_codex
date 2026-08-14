@@ -4,6 +4,9 @@ using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
 using System;
 using System.Linq;
+using System.Runtime.ExceptionServices;
+using System.Threading;
+using Semaphore = Silk.NET.Vulkan.Semaphore;
 using VkFormat = Silk.NET.Vulkan.Format;
 
 namespace Ryujinx.Graphics.Vulkan
@@ -24,6 +27,7 @@ namespace Ryujinx.Graphics.Vulkan
 
         private Semaphore[] _imageAvailableSemaphores;
         private Semaphore[] _renderFinishedSemaphores;
+        private int _disposeState;
 
         private int _frameIndex;
 
@@ -42,72 +46,103 @@ namespace Ryujinx.Graphics.Vulkan
         private ScalingFilter _currentScalingFilter;
         private bool _colorSpacePassthroughEnabled;
 
-        public unsafe Window(VulkanRenderer gd, SurfaceKHR surface, PhysicalDevice physicalDevice, Device device)
+        public Window(VulkanRenderer gd, SurfaceKHR surface, PhysicalDevice physicalDevice, Device device)
         {
             _gd = gd;
             _physicalDevice = physicalDevice;
             _device = device;
             _surface = surface;
+        }
 
+        public void Initialize()
+        {
             CreateSwapchain();
         }
 
         private void RecreateSwapchain()
         {
-            var oldSwapchain = _swapchain;
-            _swapchainIsDirty = false;
-
-            for (int i = 0; i < _swapchainImageViews.Length; i++)
-            {
-                _swapchainImageViews[i].Dispose();
-            }
-
-            // Destroy old Swapchain.
-
             _gd.Api.DeviceWaitIdle(_device);
+
+            TextureView[] oldSwapchainImageViews = _swapchainImageViews;
+            Semaphore[] oldImageAvailableSemaphores = _imageAvailableSemaphores;
+            Semaphore[] oldRenderFinishedSemaphores = _renderFinishedSemaphores;
+            SwapchainKHR oldSwapchain = _swapchain;
+
+            // Detach the old generation before destroying it. If creating the new
+            // generation fails, Dispose will only see the newly-created partial
+            // handles and cannot destroy the old generation a second time.
+            _swapchainImages = null;
+            _swapchainImageViews = null;
+            _imageAvailableSemaphores = null;
+            _renderFinishedSemaphores = null;
+            _swapchain = default;
 
             unsafe
             {
-                for (int i = 0; i < _imageAvailableSemaphores.Length; i++)
+                if (oldRenderFinishedSemaphores != null)
                 {
-                    _gd.Api.DestroySemaphore(_device, _imageAvailableSemaphores[i], null);
+                    for (int i = oldRenderFinishedSemaphores.Length - 1; i >= 0; i--)
+                    {
+                        if (oldRenderFinishedSemaphores[i].Handle != 0)
+                        {
+                            _gd.Api.DestroySemaphore(_device, oldRenderFinishedSemaphores[i], null);
+                        }
+                    }
                 }
 
-                for (int i = 0; i < _renderFinishedSemaphores.Length; i++)
+                if (oldImageAvailableSemaphores != null)
                 {
-                    _gd.Api.DestroySemaphore(_device, _renderFinishedSemaphores[i], null);
+                    for (int i = oldImageAvailableSemaphores.Length - 1; i >= 0; i--)
+                    {
+                        if (oldImageAvailableSemaphores[i].Handle != 0)
+                        {
+                            _gd.Api.DestroySemaphore(_device, oldImageAvailableSemaphores[i], null);
+                        }
+                    }
                 }
             }
 
-            _gd.SwapchainApi.DestroySwapchain(_device, oldSwapchain, Span<AllocationCallbacks>.Empty);
+            if (oldSwapchainImageViews != null)
+            {
+                for (int i = oldSwapchainImageViews.Length - 1; i >= 0; i--)
+                {
+                    oldSwapchainImageViews[i]?.Dispose();
+                }
+            }
+
+            if (oldSwapchain.Handle != 0)
+            {
+                _gd.SwapchainApi.DestroySwapchain(_device, oldSwapchain, Span<AllocationCallbacks>.Empty);
+            }
 
             CreateSwapchain();
+            _swapchainIsDirty = false;
         }
 
         private unsafe void CreateSwapchain()
         {
-            _gd.SurfaceApi.GetPhysicalDeviceSurfaceCapabilities(_physicalDevice, _surface, out var capabilities);
+            _gd.SurfaceApi.GetPhysicalDeviceSurfaceCapabilities(_physicalDevice, _surface, out var capabilities).ThrowOnError();
 
             uint surfaceFormatsCount;
 
-            _gd.SurfaceApi.GetPhysicalDeviceSurfaceFormats(_physicalDevice, _surface, &surfaceFormatsCount, null);
+            _gd.SurfaceApi.GetPhysicalDeviceSurfaceFormats(_physicalDevice, _surface, &surfaceFormatsCount, null).ThrowOnError();
 
             var surfaceFormats = new SurfaceFormatKHR[surfaceFormatsCount];
 
             fixed (SurfaceFormatKHR* pSurfaceFormats = surfaceFormats)
             {
-                _gd.SurfaceApi.GetPhysicalDeviceSurfaceFormats(_physicalDevice, _surface, &surfaceFormatsCount, pSurfaceFormats);
+                _gd.SurfaceApi.GetPhysicalDeviceSurfaceFormats(_physicalDevice, _surface, &surfaceFormatsCount, pSurfaceFormats).ThrowOnError();
             }
 
             uint presentModesCount;
 
-            _gd.SurfaceApi.GetPhysicalDeviceSurfacePresentModes(_physicalDevice, _surface, &presentModesCount, null);
+            _gd.SurfaceApi.GetPhysicalDeviceSurfacePresentModes(_physicalDevice, _surface, &presentModesCount, null).ThrowOnError();
 
             var presentModes = new PresentModeKHR[presentModesCount];
 
             fixed (PresentModeKHR* pPresentModes = presentModes)
             {
-                _gd.SurfaceApi.GetPhysicalDeviceSurfacePresentModes(_physicalDevice, _surface, &presentModesCount, pPresentModes);
+                _gd.SurfaceApi.GetPhysicalDeviceSurfacePresentModes(_physicalDevice, _surface, &presentModesCount, pPresentModes).ThrowOnError();
             }
 
             uint imageCount = capabilities.MinImageCount + 1;
@@ -123,8 +158,6 @@ namespace Ryujinx.Graphics.Vulkan
             _width = (int)extent.Width;
             _height = (int)extent.Height;
             _format = surfaceFormat.Format;
-
-            var oldSwapchain = _swapchain;
 
             var swapchainCreateInfo = new SwapchainCreateInfoKHR
             {
@@ -160,15 +193,16 @@ namespace Ryujinx.Graphics.Vulkan
                 SwizzleComponent.Blue,
                 SwizzleComponent.Alpha);
 
-            _gd.SwapchainApi.CreateSwapchain(_device, in swapchainCreateInfo, null, out _swapchain).ThrowOnError();
+            _gd.SwapchainApi.CreateSwapchain(_device, in swapchainCreateInfo, null, out SwapchainKHR swapchain).ThrowOnError();
+            _swapchain = swapchain;
 
-            _gd.SwapchainApi.GetSwapchainImages(_device, _swapchain, &imageCount, null);
+            _gd.SwapchainApi.GetSwapchainImages(_device, _swapchain, &imageCount, null).ThrowOnError();
 
             _swapchainImages = new Image[imageCount];
 
             fixed (Image* pSwapchainImages = _swapchainImages)
             {
-                _gd.SwapchainApi.GetSwapchainImages(_device, _swapchain, &imageCount, pSwapchainImages);
+                _gd.SwapchainApi.GetSwapchainImages(_device, _swapchain, &imageCount, pSwapchainImages).ThrowOnError();
             }
 
             _swapchainImageViews = new TextureView[imageCount];
@@ -187,14 +221,16 @@ namespace Ryujinx.Graphics.Vulkan
 
             for (int i = 0; i < _imageAvailableSemaphores.Length; i++)
             {
-                _gd.Api.CreateSemaphore(_device, in semaphoreCreateInfo, null, out _imageAvailableSemaphores[i]).ThrowOnError();
+                _gd.Api.CreateSemaphore(_device, in semaphoreCreateInfo, null, out Semaphore semaphore).ThrowOnError();
+                _imageAvailableSemaphores[i] = semaphore;
             }
 
             _renderFinishedSemaphores = new Semaphore[imageCount];
 
             for (int i = 0; i < _renderFinishedSemaphores.Length; i++)
             {
-                _gd.Api.CreateSemaphore(_device, in semaphoreCreateInfo, null, out _renderFinishedSemaphores[i]).ThrowOnError();
+                _gd.Api.CreateSemaphore(_device, in semaphoreCreateInfo, null, out Semaphore semaphore).ThrowOnError();
+                _renderFinishedSemaphores[i] = semaphore;
             }
         }
 
@@ -642,36 +678,95 @@ namespace Ryujinx.Graphics.Vulkan
 
         protected virtual void Dispose(bool disposing)
         {
-            if (disposing)
+            if (!disposing || Interlocked.Exchange(ref _disposeState, 1) != 0)
+            {
+                return;
+            }
+
+            TextureView[] swapchainImageViews = _swapchainImageViews;
+            Semaphore[] imageAvailableSemaphores = _imageAvailableSemaphores;
+            Semaphore[] renderFinishedSemaphores = _renderFinishedSemaphores;
+            SwapchainKHR swapchain = _swapchain;
+            IPostProcessingEffect effect = _effect;
+            IScalingFilter scalingFilter = _scalingFilter;
+
+            _swapchainImages = null;
+            _swapchainImageViews = null;
+            _imageAvailableSemaphores = null;
+            _renderFinishedSemaphores = null;
+            _swapchain = default;
+            _effect = null;
+            _scalingFilter = null;
+
+            ExceptionDispatchInfo firstException = null;
+
+            CaptureException(() => effect?.Dispose(), ref firstException);
+            CaptureException(() => scalingFilter?.Dispose(), ref firstException);
+
+            unsafe
+            {
+                if (renderFinishedSemaphores != null)
+                {
+                    for (int i = renderFinishedSemaphores.Length - 1; i >= 0; i--)
+                    {
+                        Semaphore semaphore = renderFinishedSemaphores[i];
+
+                        if (semaphore.Handle != 0)
+                        {
+                            CaptureException(() => _gd.Api.DestroySemaphore(_device, semaphore, null), ref firstException);
+                        }
+                    }
+                }
+
+                if (imageAvailableSemaphores != null)
+                {
+                    for (int i = imageAvailableSemaphores.Length - 1; i >= 0; i--)
+                    {
+                        Semaphore semaphore = imageAvailableSemaphores[i];
+
+                        if (semaphore.Handle != 0)
+                        {
+                            CaptureException(() => _gd.Api.DestroySemaphore(_device, semaphore, null), ref firstException);
+                        }
+                    }
+                }
+            }
+
+            if (swapchainImageViews != null)
+            {
+                for (int i = swapchainImageViews.Length - 1; i >= 0; i--)
+                {
+                    TextureView texture = swapchainImageViews[i];
+                    CaptureException(() => texture?.Dispose(), ref firstException);
+                }
+            }
+
+            if (_gd.SwapchainApi != null && swapchain.Handle != 0)
             {
                 unsafe
                 {
-                    for (int i = 0; i < _swapchainImageViews.Length; i++)
-                    {
-                        _swapchainImageViews[i].Dispose();
-                    }
-
-                    for (int i = 0; i < _imageAvailableSemaphores.Length; i++)
-                    {
-                        _gd.Api.DestroySemaphore(_device, _imageAvailableSemaphores[i], null);
-                    }
-
-                    for (int i = 0; i < _renderFinishedSemaphores.Length; i++)
-                    {
-                        _gd.Api.DestroySemaphore(_device, _renderFinishedSemaphores[i], null);
-                    }
-
-                    _gd.SwapchainApi.DestroySwapchain(_device, _swapchain, null);
+                    CaptureException(() => _gd.SwapchainApi.DestroySwapchain(_device, swapchain, null), ref firstException);
                 }
-
-                _effect?.Dispose();
-                _scalingFilter?.Dispose();
             }
+
+            firstException?.Throw();
         }
 
         public override void Dispose()
         {
             Dispose(true);
+        }
+
+        private static void CaptureException(Action action, ref ExceptionDispatchInfo firstException)
+        {
+            try
+            {
+                action();
+            }
+            catch (Exception exception)
+            {
+                firstException ??= ExceptionDispatchInfo.Capture(exception);
+            }
         }
     }
 }

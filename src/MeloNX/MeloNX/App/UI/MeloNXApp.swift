@@ -21,15 +21,15 @@ struct EnvironmentVariable: Codable, Hashable {
 }
 
 struct MeloNXApp: View {
-    @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @AppStorage("hasbeenfinished") var inSetup: Bool = true
     @AppStorage("skippedSetup") var skippedSetup: Bool = false
     @AppStorage("firstBoot") var firstBoot: Bool = false
-    @AppStorage("MeloNXAppMode") var appModeRaw: String = ""
     @State var viewShown = false
     @State var showedSetup = false
 
-    
+    private let lifecycleStressConfiguration =
+        EmulationLifecycleStressConfiguration.fromEnvironment()
+
     let environment: [EnvironmentVariable] = [
         EnvironmentVariable(string: "MVK_USE_METAL_PRIVATE_API", value: "1"),
         EnvironmentVariable(string: "MVK_CONFIG_USE_METAL_PRIVATE_API", value: "1"),
@@ -45,26 +45,14 @@ struct MeloNXApp: View {
     private static let runtimeInitializationLock = NSLock()
     private static var didInitializeEmulatorRuntime = false
     
-    private var shouldShowModeRouter: Bool {
-        appModeRaw.isEmpty && UIDevice.current.userInterfaceIdiom == .phone
-    }
-
-    private var selectedMode: MeloNXAppMode {
-        if let mode = MeloNXAppMode(rawValue: appModeRaw) {
-            return mode
-        }
-
-        return UIDevice.current.userInterfaceIdiom == .phone ? .controller : .emulator
-    }
-    
     var body: some View {
         Group {
-            if shouldShowModeRouter {
-                AppModeRouterView { mode in
-                    appModeRaw = mode.rawValue
+            if let lifecycleStressConfiguration {
+                EmulatorRuntimeView(environment: environment) {
+                    EmulationLifecycleStressView(
+                        configuration: lifecycleStressConfiguration
+                    )
                 }
-            } else if selectedMode == .controller {
-                RemoteControllerModeView()
             } else {
                 EmulatorRuntimeView(environment: environment) {
                     emulatorBody
@@ -157,4 +145,3 @@ struct MeloNXApp: View {
         }
     }
 }
-

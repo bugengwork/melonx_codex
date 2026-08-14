@@ -21,9 +21,11 @@ namespace Ryujinx.Graphics.GAL.Multithreading.Commands.Texture
 
         public static void Run(ref TextureGetDataSliceCommand command, ThreadedRenderer threaded, IRenderer renderer)
         {
-            PinnedSpan<byte> result = command._texture.Get(threaded).Base.GetData(command._layer, command._level);
+            ThreadedTexture texture = command._texture.Get(threaded);
+            ResultBox<PinnedSpan<byte>> resultBox = command._result.Get(threaded);
+            PinnedSpan<byte> result = texture.Base.GetData(command._layer, command._level);
 
-            command._result.Get(threaded).Result = result;
+            resultBox.Result = result;
         }
     }
 }

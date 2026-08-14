@@ -5,6 +5,7 @@ using Ryujinx.Graphics.GAL;
 using Ryujinx.Graphics.GAL.Multithreading;
 using Ryujinx.Graphics.Gpu;
 using Ryujinx.Graphics.OpenGL;
+using Ryujinx.Graphics.Vulkan;
 using Ryujinx.HLE.HOS.Applets;
 using Ryujinx.HLE.HOS.Services.Am.AppletOE.ApplicationProxyService.ApplicationProxy.Types;
 using Ryujinx.HLE.UI;
@@ -16,8 +17,11 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using static SDL2.SDL;
 using AntiAliasing = Ryujinx.Common.Configuration.AntiAliasing;
 using ScalingFilter = Ryujinx.Common.Configuration.ScalingFilter;
@@ -25,6 +29,18 @@ using Switch = Ryujinx.HLE.Switch;
 
 namespace Ryujinx.Headless.SDL2
 {
+    internal sealed class WindowConstructionRollbackException : AggregateException
+    {
+        public WindowConstructionRollbackException(
+            Exception constructionFailure,
+            IEnumerable<Exception> rollbackFailures)
+            : base(
+                "Window construction failed and its rollback did not complete.",
+                new[] { constructionFailure }.Concat(rollbackFailures))
+        {
+        }
+    }
+
     abstract partial class WindowBase : IHostUIHandler, IDisposable
     {
         protected const int DefaultWidth = 1280;
@@ -34,14 +50,29 @@ namespace Ryujinx.Headless.SDL2
         private SDL_WindowFlags FullscreenFlag = 0;
 
         private static readonly ConcurrentQueue<Action> _mainThreadActions = new();
+        private static readonly object _mainThreadActionsLock = new();
+        private static bool _mainThreadActionsEnabled;
+
+        internal static int ActiveRenderThreadCount;
 
         [LibraryImport("SDL2.framework/SDL2")]
         // TODO: Remove this as soon as SDL2-CS was updated to expose this method publicly
         private static partial IntPtr SDL_LoadBMP_RW(IntPtr src, int freesrc);
 
-        public static void QueueMainThreadAction(Action action)
+        public static bool TryQueueMainThreadAction(Action action)
         {
-            _mainThreadActions.Enqueue(action);
+            ArgumentNullException.ThrowIfNull(action);
+
+            lock (_mainThreadActionsLock)
+            {
+                if (!_mainThreadActionsEnabled)
+                {
+                    return false;
+                }
+
+                _mainThreadActions.Enqueue(action);
+                return true;
+            }
         }
 
         public bool _isPaused;
@@ -75,12 +106,23 @@ namespace Ryujinx.Headless.SDL2
         private readonly Stopwatch _chrono;
         private readonly long _ticksPerFrame;
         private readonly CancellationTokenSource _gpuCancellationTokenSource;
-        public ManualResetEvent _exitEvent;
-        public ManualResetEvent _gpuDoneEvent;
+        private Task _gpuCancellationTask = Task.CompletedTask;
+        private readonly ManualResetEvent _gpuDoneEvent;
+        private readonly ManualResetEvent _rendererFinalizeAuthorizedEvent;
 
         private long _ticks;
-        public bool _isActive;
-        private bool _isStopped;
+        private volatile bool _isActive;
+        private int _stopRequested;
+        private int _gpuDoneSignaled;
+        private int _rendererStopRequested;
+        private int _rendererFinalized;
+        private int _rendererRunLoopEntered;
+        private int _rendererRunLoopExited;
+        private int _renderLoopStarted;
+        private int _disposeState;
+        private Thread _renderLoopThread;
+        private ExceptionDispatchInfo _renderFailure;
+        private ExceptionDispatchInfo _rendererDisposeFailure;
         private uint _windowId;
 
         private string _gpuDriverName;
@@ -95,24 +137,95 @@ namespace Ryujinx.Headless.SDL2
             bool enableMouse,
             HideCursorMode hideCursorMode)
         {
-            MouseDriver = new iOSTouchDriver(hideCursorMode);
-            _inputManager = inputManager;
-            _inputManager.SetMouseDriver(MouseDriver);
-            NpadManager = _inputManager.CreateNpadManager();
-            TouchScreenManager = _inputManager.CreateTouchScreenManager();
-            _keyboardInterface = (IKeyboard)_inputManager.KeyboardDriver.GetGamepad("0");
+            _inputManager = inputManager ?? throw new ArgumentNullException(nameof(inputManager));
             _glLogLevel = glLogLevel;
             _chrono = new Stopwatch();
             _ticksPerFrame = Stopwatch.Frequency / TargetFps;
             _gpuCancellationTokenSource = new CancellationTokenSource();
-            _exitEvent = new ManualResetEvent(false);
             _gpuDoneEvent = new ManualResetEvent(false);
+            _rendererFinalizeAuthorizedEvent = new ManualResetEvent(false);
             _pauseEvent = new ManualResetEvent(true);
             _aspectRatio = aspectRatio;
             _enableMouse = enableMouse;
             HostUITheme = new HeadlessHostUiTheme();
 
-            SDL2Driver.Instance.Initialize();
+            bool mouseAttached = false;
+            bool sdlReferenceAcquired = false;
+
+            try
+            {
+                MouseDriver = new iOSTouchDriver(hideCursorMode);
+                _inputManager.SetMouseDriver(MouseDriver);
+                mouseAttached = true;
+                NpadManager = _inputManager.CreateNpadManager();
+                TouchScreenManager = _inputManager.CreateTouchScreenManager();
+                _keyboardInterface = (IKeyboard)_inputManager.KeyboardDriver.GetGamepad("0");
+
+                // The iOS SDL driver is process-owned by InputManager. MoltenVK does not
+                // create an SDL window, so taking a per-window reference would never be
+                // balanced by WindowBase.Dispose.
+                if (!OperatingSystem.IsIOS())
+                {
+                    SDL2Driver.Instance.Initialize();
+                    sdlReferenceAcquired = true;
+                }
+            }
+            catch (Exception constructionFailure)
+            {
+                List<Exception> rollbackFailures = new();
+
+                RollbackWindowConstruction(
+                    () =>
+                    {
+                        if (sdlReferenceAcquired)
+                        {
+                            SDL2Driver.Instance.Dispose();
+                        }
+                    },
+                    rollbackFailures);
+                RollbackWindowConstruction(() => TouchScreenManager?.Dispose(), rollbackFailures);
+                RollbackWindowConstruction(() => NpadManager?.Dispose(), rollbackFailures);
+                RollbackWindowConstruction(
+                    () =>
+                    {
+                        if (mouseAttached)
+                        {
+                            _inputManager.SetMouseDriver(null);
+                        }
+                        else
+                        {
+                            MouseDriver?.Dispose();
+                        }
+                    },
+                    rollbackFailures);
+                RollbackWindowConstruction(_gpuCancellationTokenSource.Dispose, rollbackFailures);
+                RollbackWindowConstruction(_gpuDoneEvent.Dispose, rollbackFailures);
+                RollbackWindowConstruction(_rendererFinalizeAuthorizedEvent.Dispose, rollbackFailures);
+                RollbackWindowConstruction(_pauseEvent.Dispose, rollbackFailures);
+
+                if (rollbackFailures.Count != 0)
+                {
+                    throw new WindowConstructionRollbackException(
+                        constructionFailure,
+                        rollbackFailures);
+                }
+
+                throw;
+            }
+        }
+
+        private static void RollbackWindowConstruction(
+            Action cleanup,
+            List<Exception> rollbackFailures)
+        {
+            try
+            {
+                cleanup();
+            }
+            catch (Exception exception)
+            {
+                rollbackFailures.Add(exception);
+            }
         }
 
         public void Initialize(Switch device, List<InputConfig> inputConfigs, bool enableKeyboard, bool enableMouse)
@@ -260,7 +373,9 @@ namespace Ryujinx.Headless.SDL2
 
         protected abstract void InitializeRenderer();
 
-        protected abstract void FinalizeWindowRenderer();
+        protected virtual void PrepareForGpuDispose() { }
+
+        protected virtual void FinalizeWindowRenderer(bool gpuDisposeSucceeded) { }
 
         protected abstract void SwapBuffers();
 
@@ -284,106 +399,294 @@ namespace Ryujinx.Headless.SDL2
 
         public void Render()
         {
-            InitializeWindowRenderer();
+            Interlocked.Increment(ref ActiveRenderThreadCount);
 
-            Device.Gpu.Renderer.Initialize(_glLogLevel);
-
-            InitializeRenderer();
-
-            SetAntiAliasing();
-
-            SetScalingFilter();
-
-            _gpuDriverName = GetGpuDriverName();
-
-            bool firstFrame = true;
-
-            Device.Gpu.Renderer.RunLoop(() =>
+            try
             {
-                Device.Gpu.SetGpuThread();
-                Device.Gpu.InitializeShaderCache(_gpuCancellationTokenSource.Token);
+                RenderCore();
+            }
+            finally
+            {
+                Interlocked.Decrement(ref ActiveRenderThreadCount);
+            }
+        }
 
-                while (_isActive)
+        private void RenderCore()
+        {
+            try
+            {
+                InitializeWindowRenderer();
+
+                Device.Gpu.Renderer.Initialize(_glLogLevel);
+
+                InitializeRenderer();
+
+                SetAntiAliasing();
+
+                SetScalingFilter();
+
+                _gpuDriverName = GetGpuDriverName();
+
+                bool firstFrame = true;
+
+                Interlocked.Exchange(ref _rendererRunLoopEntered, 1);
+
+                try
                 {
-                    if (_isStopped)
+                    Device.Gpu.Renderer.RunLoop(() =>
                     {
-                        return;
-                    }
-
-                    _pauseEvent.WaitOne();
-
-                    _ticks += _chrono.ElapsedTicks;
-
-                    _chrono.Restart();
-
-                    if (Device.WaitFifo())
-                    {
-                        Device.Statistics.RecordFifoStart();
-                        Device.ProcessFrame();
-                        Device.Statistics.RecordFifoEnd();
-                    }
-
-                    while (Device.ConsumeFrameAvailable())
-                    {
-                        Device.PresentFrame(SwapBuffers);
-
-                        if (firstFrame)
+                        try
                         {
-                            firstFrame = false;
-                            Program.TriggerCallback("ran-first-frame");
-                        }
-                    }
+                            Device.Gpu.SetGpuThread();
+                            Device.Gpu.InitializeShaderCache(_gpuCancellationTokenSource.Token);
 
-                    if (_ticks >= _ticksPerFrame)
-                    {
-                        string dockedMode = Device.System.State.DockedMode ? "Docked" : "Handheld";
-                        float scale = GraphicsConfig.ResScale;
-                        if (scale != 1)
+                            while (_isActive && !IsStopRequested)
+                            {
+                                _pauseEvent.WaitOne();
+
+                                if (IsStopRequested)
+                                {
+                                    break;
+                                }
+
+                                _ticks += _chrono.ElapsedTicks;
+
+                                _chrono.Restart();
+
+                                if (Device.WaitFifo())
+                                {
+                                    Device.Statistics.RecordFifoStart();
+                                    Device.ProcessFrame();
+                                    Device.Statistics.RecordFifoEnd();
+                                }
+
+                                while (Device.ConsumeFrameAvailable())
+                                {
+                                    Device.PresentFrame(SwapBuffers);
+
+                                    if (firstFrame)
+                                    {
+                                        firstFrame = false;
+                                        Program.LogLifecycleMilestone("FirstFrame");
+                                        Program.TriggerCallback("ran-first-frame");
+                                    }
+                                }
+
+                                if (_ticks >= _ticksPerFrame)
+                                {
+                                    string dockedMode = Device.System.State.DockedMode ? "Docked" : "Handheld";
+                                    float scale = GraphicsConfig.ResScale;
+                                    if (scale != 1)
+                                    {
+                                        dockedMode += $" ({scale}x)";
+                                    }
+
+                                    StatusUpdatedEvent?.Invoke(this, new StatusUpdatedEventArgs(
+                                        Device.EnableDeviceVsync,
+                                        dockedMode,
+                                        Device.Configuration.AspectRatio.ToText(),
+                                        $"Game: {Device.Statistics.GetGameFrameRate():00.00} FPS ({Device.Statistics.GetGameFrameTime():00.00} ms)",
+                                        $"FIFO: {Device.Statistics.GetFifoPercent():0.00} %",
+                                        $"GPU: {_gpuDriverName}"));
+
+                                    _ticks = Math.Min(_ticks - _ticksPerFrame, _ticksPerFrame);
+                                }
+                            }
+                        }
+                        catch (OperationCanceledException) when (IsStopRequested)
                         {
-                            dockedMode += $" ({scale}x)";
                         }
-
-                        StatusUpdatedEvent?.Invoke(this, new StatusUpdatedEventArgs(
-                            Device.EnableDeviceVsync,
-                            dockedMode,
-                            Device.Configuration.AspectRatio.ToText(),
-                            $"Game: {Device.Statistics.GetGameFrameRate():00.00} FPS ({Device.Statistics.GetGameFrameTime():00.00} ms)",
-                            $"FIFO: {Device.Statistics.GetFifoPercent():0.00} %",
-                            $"GPU: {_gpuDriverName}"));
-
-                        _ticks = Math.Min(_ticks - _ticksPerFrame, _ticksPerFrame);
-                    }
+                        catch (Exception exception)
+                        {
+                            RecordRenderFailure(exception);
+                            RequestStop();
+                        }
+                        finally
+                        {
+                            try
+                            {
+                                // Make sure all commands submitted by the GPU producer are
+                                // consumed before the HLE teardown starts.
+                                if (Device.Gpu.Renderer is ThreadedRenderer threaded)
+                                {
+                                    threaded.FlushThreadedCommands();
+                                }
+                            }
+                            catch (Exception exception)
+                            {
+                                RecordRenderFailure(exception);
+                            }
+                            finally
+                            {
+                                SignalGpuDone();
+                            }
+                        }
+                    });
                 }
-
-                // Make sure all commands in the run loop are fully executed before leaving the loop.
-                if (Device.Gpu.Renderer is ThreadedRenderer threaded)
+                finally
                 {
-                    threaded.FlushThreadedCommands();
+                    Interlocked.Exchange(ref _rendererRunLoopExited, 1);
                 }
+            }
+            catch (OperationCanceledException) when (IsStopRequested)
+            {
+                WaitForGpuProducerExit();
+                SignalGpuDone();
+            }
+            catch (Exception exception)
+            {
+                RecordRenderFailure(exception);
+                RequestStop();
+                WaitForGpuProducerExit();
+                SignalGpuDone();
+            }
+            finally
+            {
+                // GPU disposal must happen after Switch.Dispose. The session
+                // coordinator opens this gate once HLE teardown is complete.
+                WaitForGpuProducerExit();
+                SignalGpuDone();
+                _rendererFinalizeAuthorizedEvent.WaitOne();
 
+                try
+                {
+                    Program.LogLifecycleMilestone("GpuDisposeStart");
+                    DisposeGpuOnRenderThread();
+                    Program.LogLifecycleMilestone("GpuDisposed");
+                }
+                catch (Exception exception)
+                {
+                    Program.LogLifecycleMilestone("GpuDisposeFault");
+                    RecordRendererDisposeFailure(exception);
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _rendererFinalized, 1);
+                    SignalGpuDone();
+                }
+            }
+        }
+
+        private bool IsStopRequested => Volatile.Read(ref _stopRequested) != 0;
+
+        private void RecordRenderFailure(Exception exception)
+        {
+            Interlocked.CompareExchange(
+                ref _renderFailure,
+                ExceptionDispatchInfo.Capture(exception),
+                null);
+
+            if (exception is VulkanRendererInitializationRollbackException ||
+                Volatile.Read(ref _gpuDoneSignaled) != 0)
+            {
+                RecordRendererDisposeFailure(exception);
+            }
+        }
+
+        private void RecordRendererDisposeFailure(Exception exception)
+        {
+            Interlocked.CompareExchange(
+                ref _rendererDisposeFailure,
+                ExceptionDispatchInfo.Capture(exception),
+                null);
+        }
+
+        private void DisposeGpuOnRenderThread()
+        {
+            ExceptionDispatchInfo failure = null;
+            bool gpuDisposeSucceeded = false;
+
+            RunDisposeStep(
+                "renderer context preparation",
+                PrepareForGpuDispose,
+                ref failure);
+            RunDisposeStep(
+                "GPU context",
+                () =>
+                {
+                    Device?.DisposeGpu();
+                    gpuDisposeSucceeded =
+                        failure == null &&
+                        Volatile.Read(ref _rendererDisposeFailure) == null;
+                },
+                ref failure);
+            RunDisposeStep(
+                "window renderer finalization",
+                () => FinalizeWindowRenderer(gpuDisposeSucceeded),
+                ref failure);
+
+            failure?.Throw();
+        }
+
+        private void WaitForGpuProducerExit()
+        {
+            try
+            {
+                if (Device?.Gpu?.Renderer is ThreadedRenderer threaded)
+                {
+                    threaded.WaitForGpuThreadExit();
+                }
+            }
+            catch (Exception exception)
+            {
+                RecordRenderFailure(exception);
+            }
+        }
+
+        private static void RunDisposeStep(string name, Action action, ref ExceptionDispatchInfo failure)
+        {
+            try
+            {
+                action();
+            }
+            catch (Exception exception)
+            {
+                if (failure == null)
+                {
+                    failure = ExceptionDispatchInfo.Capture(exception);
+                }
+                else
+                {
+                    Logger.Error?.Print(LogClass.Application, $"Additional failure while disposing {name}: {exception}");
+                }
+            }
+        }
+
+        private void SignalGpuDone()
+        {
+            if (Interlocked.Exchange(ref _gpuDoneSignaled, 1) == 0)
+            {
                 _gpuDoneEvent.Set();
-            });
+            }
+        }
 
-            FinalizeWindowRenderer();
+        public void RequestStop()
+        {
+            if (Interlocked.Exchange(ref _stopRequested, 1) == 0)
+            {
+                try
+                {
+                    Volatile.Write(ref _gpuCancellationTask, _gpuCancellationTokenSource.CancelAsync());
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+            }
+
+            _isActive = false;
+
+            try
+            {
+                _pauseEvent.Set();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
         }
 
         public void Exit()
         {
-            TouchScreenManager?.Dispose();
-            NpadManager?.Dispose();
-
-            if (_isStopped)
-            {
-                return;
-            }
-
-            _gpuCancellationTokenSource.Cancel();
-
-            _isStopped = true;
-            _isActive = false;
-
-            _exitEvent.WaitOne();
-            _exitEvent.Dispose();
+            RequestStop();
         }
 
         public static void ProcessMainThreadQueue()
@@ -396,7 +699,7 @@ namespace Ryujinx.Headless.SDL2
 
         public void MainLoop()
         {
-            while (_isActive)
+            while (_isActive && !IsStopRequested)
             {
                 UpdateFrame();
 
@@ -408,8 +711,6 @@ namespace Ryujinx.Headless.SDL2
                 // Why was this commented out???
                 Thread.Sleep(1); 
             }
-
-            _exitEvent.Set();
         }
 
         private void NvidiaStutterWorkaround()
@@ -438,7 +739,7 @@ namespace Ryujinx.Headless.SDL2
                 return true;
             }
 
-            if (_isStopped)
+            if (IsStopRequested)
             {
                 return false;
             }
@@ -467,25 +768,155 @@ namespace Ryujinx.Headless.SDL2
 
         public void Execute()
         {
+            if (IsStopRequested)
+            {
+                SignalGpuDone();
+                return;
+            }
+
             _chrono.Restart();
             _isActive = true;
 
-            InitializeWindow();
-
-            Thread renderLoopThread = new(Render)
+            lock (_mainThreadActionsLock)
             {
-                Name = "GUI.RenderLoop",
-            };
-            renderLoopThread.Start();
+                _mainThreadActionsEnabled = true;
+            }
 
-            MainLoop();
+            try
+            {
+                InitializeWindow();
 
-            // NOTE: The render loop is allowed to stay alive until the renderer itself is disposed, as it may handle resource dispose.
-            // We only need to wait for all commands submitted during the main gpu loop to be processed.
-            _gpuDoneEvent.WaitOne();
-            _gpuDoneEvent.Dispose();
+                if (IsStopRequested)
+                {
+                    SignalGpuDone();
+                    return;
+                }
 
-            Exit();
+                _renderLoopThread = new Thread(Render)
+                {
+                    Name = "GUI.RenderLoop",
+                };
+                _renderLoopThread.Start();
+                Interlocked.Exchange(ref _renderLoopStarted, 1);
+
+                MainLoop();
+
+                // Wait for the GPU producer barrier while servicing SDL work that
+                // was accepted before Stop closed the main loop.
+                while (!_gpuDoneEvent.WaitOne(1))
+                {
+                    ProcessMainThreadQueue();
+                }
+            }
+            finally
+            {
+                // Close the enqueue gate before the final drain. This prevents the
+                // process-owned SDL worker from waiting on work left for a later session.
+                lock (_mainThreadActionsLock)
+                {
+                    _mainThreadActionsEnabled = false;
+                }
+
+                ProcessMainThreadQueue();
+            }
+        }
+
+        public void RequestRendererStopAfterDrain()
+        {
+            if (Interlocked.Exchange(ref _rendererStopRequested, 1) != 0)
+            {
+                return;
+            }
+
+            Thread renderLoopThread = Volatile.Read(ref _renderLoopThread);
+
+            try
+            {
+                if (renderLoopThread == null || Volatile.Read(ref _renderLoopStarted) == 0)
+                {
+                    _renderLoopThread = new Thread(() =>
+                    {
+                        Interlocked.Increment(ref ActiveRenderThreadCount);
+
+                        try
+                        {
+                            Program.LogLifecycleMilestone("GpuDisposeStart");
+                            DisposeGpuOnRenderThread();
+                            Program.LogLifecycleMilestone("GpuDisposed");
+                        }
+                        catch (Exception exception)
+                        {
+                            Program.LogLifecycleMilestone("GpuDisposeFault");
+                            RecordRendererDisposeFailure(exception);
+                        }
+                        finally
+                        {
+                            try
+                            {
+                                Interlocked.Exchange(ref _rendererFinalized, 1);
+                                SignalGpuDone();
+                            }
+                            finally
+                            {
+                                Interlocked.Decrement(ref ActiveRenderThreadCount);
+                            }
+                        }
+                    })
+                    {
+                        Name = "GUI.RenderLoop.Cleanup",
+                    };
+                    _renderLoopThread.Start();
+                    Interlocked.Exchange(ref _renderLoopStarted, 1);
+
+                    return;
+                }
+
+                if (renderLoopThread.IsAlive &&
+                    Volatile.Read(ref _rendererRunLoopEntered) != 0 &&
+                    Volatile.Read(ref _rendererRunLoopExited) == 0)
+                {
+                    if (Device.Gpu.Renderer is not ThreadedRenderer threaded)
+                    {
+                        throw new InvalidOperationException("The headless renderer is expected to use ThreadedRenderer.");
+                    }
+
+                    threaded.RequestStopAfterDrain();
+                }
+            }
+            finally
+            {
+                _rendererFinalizeAuthorizedEvent.Set();
+            }
+        }
+
+        public void StopAndWaitForGpu()
+        {
+            RequestStop();
+
+            if (Volatile.Read(ref _renderLoopStarted) != 0)
+            {
+                _gpuDoneEvent.WaitOne();
+            }
+        }
+
+        public void WaitForRendererExit()
+        {
+            Thread renderLoopThread = Volatile.Read(ref _renderLoopThread);
+
+            if (renderLoopThread != null && renderLoopThread != Thread.CurrentThread)
+            {
+                renderLoopThread.Join();
+            }
+        }
+
+        public void ThrowIfRenderFailed()
+        {
+            Volatile.Read(ref _renderFailure)?.Throw();
+        }
+
+        public void ThrowIfRendererDisposeFailed()
+        {
+            Volatile.Read(ref _rendererDisposeFailure)?.Throw();
         }
 
         public void DisplayInputDialog(SoftwareKeyboardUIArgs args, Action<string> onTextEntered)
@@ -574,21 +1005,56 @@ namespace Ryujinx.Headless.SDL2
 
         protected virtual void Dispose(bool disposing)
         {
-            if (disposing)
+            if (!disposing || Interlocked.Exchange(ref _disposeState, 1) != 0)
             {
-                _isActive = false;
-                TouchScreenManager?.Dispose();
-                NpadManager.Dispose();
-
-                if (this is not Vulkan.MoltenVKWindow)
-                {
-                    SDL2Driver.Instance.UnregisterWindow(_windowId);
-
-                    SDL_DestroyWindow(WindowHandle);
-
-                    SDL2Driver.Instance.Dispose();
-                }
+                return;
             }
+
+            ExceptionDispatchInfo failure = null;
+
+            RunDisposeStep("GPU producer", StopAndWaitForGpu, ref failure);
+
+            if (Device != null && Volatile.Read(ref _rendererFinalized) == 0)
+            {
+                RunDisposeStep("renderer stop", RequestRendererStopAfterDrain, ref failure);
+            }
+            else
+            {
+                RunDisposeStep("renderer authorization", () => _rendererFinalizeAuthorizedEvent.Set(), ref failure);
+            }
+
+            RunDisposeStep("renderer thread", WaitForRendererExit, ref failure);
+            RunDisposeStep("renderer GPU disposal", ThrowIfRendererDisposeFailed, ref failure);
+            RunDisposeStep(
+                "GPU cancellation callbacks",
+                () => Volatile.Read(ref _gpuCancellationTask).GetAwaiter().GetResult(),
+                ref failure);
+
+            RunDisposeStep("touchscreen manager", () => TouchScreenManager?.Dispose(), ref failure);
+            RunDisposeStep("npad manager", () => NpadManager?.Dispose(), ref failure);
+            RunDisposeStep("mouse driver", () => _inputManager.SetMouseDriver(null), ref failure);
+
+            RunDisposeStep("GPU cancellation source", _gpuCancellationTokenSource.Dispose, ref failure);
+            RunDisposeStep("GPU done event", _gpuDoneEvent.Dispose, ref failure);
+            RunDisposeStep("renderer authorization event", _rendererFinalizeAuthorizedEvent.Dispose, ref failure);
+            RunDisposeStep("pause event", _pauseEvent.Dispose, ref failure);
+
+            if (this is not Vulkan.MoltenVKWindow)
+            {
+                RunDisposeStep("SDL window registration", () => SDL2Driver.Instance.UnregisterWindow(_windowId), ref failure);
+                RunDisposeStep("SDL window", () => SDL_DestroyWindow(WindowHandle), ref failure);
+                RunDisposeStep("SDL driver reference", SDL2Driver.Instance.Dispose, ref failure);
+            }
+
+            StatusUpdatedEvent = null;
+            TouchScreenManager = null;
+            NpadManager = null;
+            Renderer = null;
+            Device = null;
+            WindowHandle = IntPtr.Zero;
+            _renderLoopThread = null;
+
+            failure?.Throw();
         }
     }
 }

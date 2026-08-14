@@ -14,6 +14,7 @@ using Ryujinx.HLE.HOS.Services;
 using Ryujinx.HLE.HOS.Services.Account.Acc;
 using Ryujinx.HLE.HOS.Services.Am.AppletAE.AllSystemAppletProxiesService.SystemAppletProxy;
 using Ryujinx.HLE.HOS.Services.Apm;
+using Ryujinx.HLE.HOS.Services.Bluetooth.BluetoothDriver;
 using Ryujinx.HLE.HOS.Services.Caps;
 using Ryujinx.HLE.HOS.Services.Mii;
 using Ryujinx.HLE.HOS.Services.Nfc.Nfp.NfpManager;
@@ -23,6 +24,7 @@ using Ryujinx.HLE.HOS.Services.Pcv.Bpc;
 using Ryujinx.HLE.HOS.Services.Sdb.Pl;
 using Ryujinx.HLE.HOS.Services.Settings;
 using Ryujinx.HLE.HOS.Services.Sm;
+using Ryujinx.HLE.HOS.Services.Sockets.Bsd;
 using Ryujinx.HLE.HOS.Services.SurfaceFlinger;
 using Ryujinx.HLE.HOS.Services.Time.Clock;
 using Ryujinx.HLE.HOS.SystemState;
@@ -33,6 +35,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 
 namespace Ryujinx.HLE.HOS
@@ -405,8 +408,10 @@ namespace Ryujinx.HLE.HOS
                             process.DecrementReferenceCount();
                         }
 
-                        // The application existed, now surface flinger can exit too.
-                        SurfaceFlinger.Dispose();
+                        // The application exited, so composition can stop. Final
+                        // SurfaceFlinger cleanup waits until service processes are
+                        // terminated to avoid racing their binder/event access.
+                        SurfaceFlinger.RequestStop();
 
                         // Terminate HLE services (must be done after the application is already terminated,
                         // otherwise the application will receive errors due to service termination).
@@ -415,6 +420,8 @@ namespace Ryujinx.HLE.HOS
                             process.Terminate();
                             process.DecrementReferenceCount();
                         }
+
+                        SurfaceFlinger.Dispose();
 
                         KernelContext.Processes.Clear();
                     }
@@ -434,16 +441,44 @@ namespace Ryujinx.HLE.HOS
                 // Wait until the termination thread is done terminating all the other threads.
                 terminationThread.HostThread.Join();
 
+                ExceptionDispatchInfo firstException = null;
+
                 // Destroy nvservices channels as KThread could be waiting on some user events.
                 // This is safe as KThread that are likely to call ioctls are going to be terminated by the post handler hook on the SVC facade.
-                INvDrvServices.Destroy();
+                CaptureDisposeException(INvDrvServices.Destroy, ref firstException);
+                CaptureDisposeException(BsdContext.ReleaseAll, ref firstException);
 
                 if (LibHacHorizonManager.ApplicationClient != null)
                 {
-                    LibHacHorizonManager.PmClient.Fs.UnregisterProgram(LibHacHorizonManager.ApplicationClient.Os.GetCurrentProcessId().Value).ThrowIfFailure();
+                    CaptureDisposeException(
+                        () => LibHacHorizonManager.PmClient.Fs.UnregisterProgram(LibHacHorizonManager.ApplicationClient.Os.GetCurrentProcessId().Value).ThrowIfFailure(),
+                        ref firstException);
                 }
 
-                KernelContext.Dispose();
+                // Process handle tables and service threads are gone at this point. Static
+                // service state must stop retaining objects owned by this KernelContext
+                // before the context itself is disposed.
+                CaptureDisposeException(
+                    () => TimeServiceManager.Instance.ReleaseSession(Device),
+                    ref firstException);
+                CaptureDisposeException(BluetoothEventManager.Reset, ref firstException);
+                CaptureDisposeException(KernelContext.Dispose, ref firstException);
+
+                firstException?.Throw();
+            }
+        }
+
+        private static void CaptureDisposeException(
+            Action dispose,
+            ref ExceptionDispatchInfo firstException)
+        {
+            try
+            {
+                dispose();
+            }
+            catch (Exception exception)
+            {
+                firstException ??= ExceptionDispatchInfo.Capture(exception);
             }
         }
 

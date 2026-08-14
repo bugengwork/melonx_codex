@@ -147,7 +147,9 @@ func showLaunchAppAlert(jsonData: Data, in viewController: UIViewController) {
             }
         } else {
             // print("Hopefully JIT is enabled now...")
-            Ryujinx.shared.checkForJIT()
+            Task { @MainActor in
+                Ryujinx.shared.checkForJIT()
+            }
         }
         
     } catch {

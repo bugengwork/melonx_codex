@@ -7,6 +7,7 @@
 
 import Foundation
 
+@MainActor
 class InGameSettingsManager: PerGameSettingsManaging {
     @Published var config: [String: Ryujinx.Arguments]
     

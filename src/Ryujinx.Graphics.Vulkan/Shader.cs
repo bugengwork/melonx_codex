@@ -5,6 +5,8 @@ using shaderc;
 using Silk.NET.Vulkan;
 using System;
 using System.Runtime.InteropServices;
+using System.Runtime.ExceptionServices;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Ryujinx.Graphics.Vulkan
@@ -21,7 +23,7 @@ namespace Ryujinx.Graphics.Vulkan
         private readonly Device _device;
         private readonly ShaderStageFlags _stage;
 
-        private bool _disposed;
+        private int _disposeState;
         private ShaderModule _module;
 
         public ShaderStageFlags StageFlags => _stage;
@@ -150,11 +152,38 @@ namespace Ryujinx.Graphics.Vulkan
 
         public unsafe void Dispose()
         {
-            if (!_disposed)
+            if (Interlocked.Exchange(ref _disposeState, 1) != 0)
             {
-                _api.DestroyShaderModule(_device, _module, null);
-                _disposed = true;
+                return;
             }
+
+            ExceptionDispatchInfo failure = null;
+
+            try
+            {
+                CompileTask.GetAwaiter().GetResult();
+            }
+            catch (Exception exception)
+            {
+                failure = ExceptionDispatchInfo.Capture(exception);
+            }
+
+            ShaderModule module = _module;
+            _module = default;
+
+            if (module.Handle != 0)
+            {
+                try
+                {
+                    _api.DestroyShaderModule(_device, module, null);
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
+                }
+            }
+
+            failure?.Throw();
         }
     }
 }

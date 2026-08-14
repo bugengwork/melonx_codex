@@ -576,6 +576,7 @@ namespace Ryujinx.HLE.HOS.Services.Nv
             }
 
             DeviceFileIdRegistry.Clear();
+            NvMapDeviceFile.Destroy();
         }
     }
 }

@@ -6,6 +6,8 @@ using Ryujinx.Graphics.OpenGL.Image;
 using Ryujinx.Graphics.OpenGL.Queries;
 using Ryujinx.Graphics.Shader.Translation;
 using System;
+using System.Runtime.ExceptionServices;
+using System.Threading;
 
 namespace Ryujinx.Graphics.OpenGL
 {
@@ -28,6 +30,7 @@ namespace Ryujinx.Graphics.OpenGL
         internal TextureCopyMS TextureCopyMS { get; }
 
         private readonly Sync _sync;
+        private int _disposeState;
 
         public event EventHandler<ScreenCaptureImageInfo> ScreenCaptured;
 
@@ -282,15 +285,38 @@ namespace Ryujinx.Graphics.OpenGL
 
         public void Dispose()
         {
-            _textureCopy.Dispose();
-            _backgroundTextureCopy.Dispose();
-            TextureCopyMS.Dispose();
-            PersistentBuffers.Dispose();
-            ResourcePool.Dispose();
-            _pipeline.Dispose();
-            _window.Dispose();
-            _counters.Dispose();
-            _sync.Dispose();
+            if (Interlocked.Exchange(ref _disposeState, 1) != 0)
+            {
+                return;
+            }
+
+            ExceptionDispatchInfo firstException = null;
+
+            CaptureDisposeException(_textureCopy.Dispose, ref firstException);
+            CaptureDisposeException(_backgroundTextureCopy.Dispose, ref firstException);
+            CaptureDisposeException(TextureCopyMS.Dispose, ref firstException);
+            CaptureDisposeException(PersistentBuffers.Dispose, ref firstException);
+            CaptureDisposeException(ResourcePool.Dispose, ref firstException);
+            CaptureDisposeException(_pipeline.Dispose, ref firstException);
+            CaptureDisposeException(_window.Dispose, ref firstException);
+            CaptureDisposeException(_counters.Dispose, ref firstException);
+            CaptureDisposeException(_sync.Dispose, ref firstException);
+
+            firstException?.Throw();
+        }
+
+        private static void CaptureDisposeException(
+            Action dispose,
+            ref ExceptionDispatchInfo firstException)
+        {
+            try
+            {
+                dispose();
+            }
+            catch (Exception exception)
+            {
+                firstException ??= ExceptionDispatchInfo.Capture(exception);
+            }
         }
 
         public IProgram LoadProgramBinary(byte[] programBinary, bool hasFragmentShader, ShaderInfo info)

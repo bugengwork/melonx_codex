@@ -15,7 +15,12 @@ class ImportHandler {
                 return
             }
             
-            _ = url.startAccessingSecurityScopedResource()
+            let isAccessingSecurityScopedResource = url.startAccessingSecurityScopedResource()
+            defer {
+                if isAccessingSecurityScopedResource {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
             
             do {
                 let handle = try FileHandle(forReadingFrom: url)
@@ -36,6 +41,7 @@ class ImportHandler {
         }
     }
     
+    @MainActor
     static public func handleAddingGame(result: Result<[URL], Error>) {
         switch result {
         case .success(let urls):
@@ -79,6 +85,7 @@ class ImportHandler {
         }
     }
     
+    @MainActor
     static public func handleFirmwareImport(result: Result<[URL], Error>) {
         switch result {
         case .success(let url):

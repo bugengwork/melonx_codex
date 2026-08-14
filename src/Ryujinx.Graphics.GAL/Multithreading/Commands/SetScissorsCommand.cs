@@ -1,4 +1,5 @@
 using Ryujinx.Graphics.GAL.Multithreading.Model;
+using System;
 
 namespace Ryujinx.Graphics.GAL.Multithreading.Commands
 {
@@ -14,9 +15,16 @@ namespace Ryujinx.Graphics.GAL.Multithreading.Commands
 
         public static void Run(ref SetScissorsCommand command, ThreadedRenderer threaded, IRenderer renderer)
         {
-            renderer.Pipeline.SetScissors(command._scissors.Get(threaded));
+            Span<Rectangle<int>> scissors = command._scissors.Get(threaded);
 
-            command._scissors.Dispose(threaded);
+            try
+            {
+                renderer.Pipeline.SetScissors(scissors);
+            }
+            finally
+            {
+                command._scissors.Dispose(threaded);
+            }
         }
     }
 }

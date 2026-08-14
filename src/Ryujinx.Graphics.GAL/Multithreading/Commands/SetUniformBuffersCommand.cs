@@ -16,8 +16,15 @@ namespace Ryujinx.Graphics.GAL.Multithreading.Commands
         public static void Run(ref SetUniformBuffersCommand command, ThreadedRenderer threaded, IRenderer renderer)
         {
             Span<BufferAssignment> buffers = command._buffers.Get(threaded);
-            renderer.Pipeline.SetUniformBuffers(threaded.Buffers.MapBufferRanges(buffers));
-            command._buffers.Dispose(threaded);
+
+            try
+            {
+                renderer.Pipeline.SetUniformBuffers(threaded.Buffers.MapBufferRanges(buffers));
+            }
+            finally
+            {
+                command._buffers.Dispose(threaded);
+            }
         }
     }
 }

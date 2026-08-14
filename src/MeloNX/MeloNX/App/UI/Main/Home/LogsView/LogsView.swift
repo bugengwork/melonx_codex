@@ -33,6 +33,9 @@ struct LogView: View {
         .task {
             for await log in LogCapture.shared.logs {
                 logs.append(log)
+                if logs.count > maxDisplayLines {
+                    logs.removeFirst(logs.count - maxDisplayLines)
+                }
             }
         }
     }
@@ -41,6 +44,5 @@ struct LogView: View {
         showingLogs = false
     }
 }
-
 
 

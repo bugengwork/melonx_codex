@@ -3,6 +3,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Numerics;
+using System.Runtime.ExceptionServices;
 
 namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd
 {
@@ -155,6 +156,66 @@ namespace Ryujinx.HLE.HOS.Services.Sockets.Bsd
             }
 
             return LinuxError.SUCCESS;
+        }
+
+        private void DisposeAllFileDescriptors()
+        {
+            ExceptionDispatchInfo firstException = null;
+            List<IFileDescriptor> filesToDispose = new();
+
+            lock (_lock)
+            {
+                for (int index = 0; index < _fds.Count; index++)
+                {
+                    IFileDescriptor file = _fds[index];
+                    _fds[index] = null;
+
+                    if (file != null && --file.Refcount <= 0)
+                    {
+                        filesToDispose.Add(file);
+                    }
+                }
+
+                _fds.Clear();
+            }
+
+            foreach (IFileDescriptor file in filesToDispose)
+            {
+                try
+                {
+                    file.Dispose();
+                }
+                catch (Exception exception)
+                {
+                    firstException ??= ExceptionDispatchInfo.Capture(exception);
+                }
+            }
+
+            firstException?.Throw();
+        }
+
+        internal static void ReleaseAll()
+        {
+            ExceptionDispatchInfo firstException = null;
+
+            foreach (KeyValuePair<ulong, BsdContext> entry in _registry)
+            {
+                if (!_registry.TryRemove(entry.Key, out BsdContext context))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    context.DisposeAllFileDescriptors();
+                }
+                catch (Exception exception)
+                {
+                    firstException ??= ExceptionDispatchInfo.Capture(exception);
+                }
+            }
+
+            firstException?.Throw();
         }
 
         public static BsdContext GetOrRegister(ulong processId)

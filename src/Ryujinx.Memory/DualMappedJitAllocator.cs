@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Diagnostics;
+using System.Threading;
 using Ryujinx.Common.Logging;
 
 namespace Ryujinx.Memory
@@ -15,10 +16,12 @@ namespace Ryujinx.Memory
     /// </summary>
     public class DualMappedJitAllocator : IDisposable
     {
+        private static long _successfulMappingCount;
 
         public IntPtr RwPtr { get; private set; }
         public IntPtr RxPtr { get; private set; }
         public ulong Size { get; private set; }
+        public static long SuccessfulMappingCount => Interlocked.Read(ref _successfulMappingCount);
 
         [DllImport("BreakpointJIT.framework/BreakpointJIT", EntryPoint = "BreakGetJITMapping")]
         public static extern unsafe byte* BreakGetJITMappingPub(byte* addr, nuint bytes);
@@ -97,6 +100,10 @@ namespace Ryujinx.Memory
 
             RwPtr = (IntPtr)bufRW;
             RxPtr = (IntPtr)bufRX;
+
+            // Telemetry only. This is intentionally cumulative and does not change
+            // the existing mapping ownership or disposal behavior.
+            Interlocked.Increment(ref _successfulMappingCount);
         }
 
         public void Dispose()

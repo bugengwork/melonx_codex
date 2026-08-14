@@ -4,6 +4,8 @@ namespace Ryujinx.HLE.HOS.Services.Bluetooth.BluetoothDriver
 {
     static class BluetoothEventManager
     {
+        internal static object SyncRoot { get; } = new();
+
         public static KEvent InitializeBleDebugEvent;
         public static int InitializeBleDebugEventHandle;
 
@@ -21,5 +23,25 @@ namespace Ryujinx.HLE.HOS.Services.Bluetooth.BluetoothDriver
 
         public static KEvent RegisterBleEvent;
         public static int RegisterBleEventHandle;
+
+        internal static void Reset()
+        {
+            lock (SyncRoot)
+            {
+                InitializeBleDebugEvent = null;
+                InitializeBleDebugEventHandle = 0;
+                UnknownBleDebugEvent = null;
+                UnknownBleDebugEventHandle = 0;
+                RegisterBleDebugEvent = null;
+                RegisterBleDebugEventHandle = 0;
+
+                InitializeBleEvent = null;
+                InitializeBleEventHandle = 0;
+                UnknownBleEvent = null;
+                UnknownBleEventHandle = 0;
+                RegisterBleEvent = null;
+                RegisterBleEventHandle = 0;
+            }
+        }
     }
 }

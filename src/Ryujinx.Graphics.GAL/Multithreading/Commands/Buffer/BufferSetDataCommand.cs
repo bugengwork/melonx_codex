@@ -20,8 +20,15 @@ namespace Ryujinx.Graphics.GAL.Multithreading.Commands.Buffer
         public static void Run(ref BufferSetDataCommand command, ThreadedRenderer threaded, IRenderer renderer)
         {
             ReadOnlySpan<byte> data = command._data.Get(threaded);
-            renderer.SetBufferData(threaded.Buffers.MapBuffer(command._buffer), command._offset, data);
-            command._data.Dispose(threaded);
+
+            try
+            {
+                renderer.SetBufferData(threaded.Buffers.MapBuffer(command._buffer), command._offset, data);
+            }
+            finally
+            {
+                command._data.Dispose(threaded);
+            }
         }
     }
 }

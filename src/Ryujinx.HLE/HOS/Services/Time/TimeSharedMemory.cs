@@ -11,6 +11,7 @@ namespace Ryujinx.HLE.HOS.Services.Time
 {
     class TimeSharedMemory
     {
+        private readonly object _sessionLock = new();
         private Switch _device;
         private KSharedMemory _sharedMemory;
         private SharedMemoryStorage _timeSharedMemoryStorage;
@@ -26,13 +27,34 @@ namespace Ryujinx.HLE.HOS.Services.Time
 
         public void Initialize(Switch device, KSharedMemory sharedMemory, SharedMemoryStorage timeSharedMemoryStorage, int timeSharedMemorySize)
         {
-            _device = device;
-            _sharedMemory = sharedMemory;
-            _timeSharedMemoryStorage = timeSharedMemoryStorage;
-            _timeSharedMemorySize = timeSharedMemorySize;
+            lock (_sessionLock)
+            {
+                _device = device;
+                _sharedMemory = sharedMemory;
+                _timeSharedMemoryStorage = timeSharedMemoryStorage;
+                _timeSharedMemorySize = timeSharedMemorySize;
+            }
 
             // Clean the shared memory
             timeSharedMemoryStorage.ZeroFill();
+        }
+
+        internal bool ReleaseSession(Switch device)
+        {
+            lock (_sessionLock)
+            {
+                if (!ReferenceEquals(_device, device))
+                {
+                    return false;
+                }
+
+                _device = null;
+                _sharedMemory = null;
+                _timeSharedMemoryStorage = null;
+                _timeSharedMemorySize = 0;
+
+                return true;
+            }
         }
 
         public KSharedMemory GetSharedMemory()

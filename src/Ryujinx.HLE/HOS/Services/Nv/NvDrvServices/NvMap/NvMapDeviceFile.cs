@@ -237,6 +237,11 @@ namespace Ryujinx.HLE.HOS.Services.Nv.NvDrvServices.NvMap
             // _maps.TryRemove(GetOwner(), out _);
         }
 
+        internal static void Destroy()
+        {
+            _maps.Clear();
+        }
+
         private int CreateHandleFromMap(NvMapHandle map)
         {
             return _maps.Add(map);

@@ -21,7 +21,8 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
 
         private readonly Dictionary<long, Layer> _layers;
 
-        private bool _isRunning;
+        private volatile bool _isRunning;
+        private int _disposeState;
 
         private readonly Thread _composerThread;
 
@@ -73,6 +74,9 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
 
             UpdateSwapInterval(1);
 
+            // Set this before starting the thread so Dispose cannot race with the
+            // thread entry point and accidentally allow the loop to start later.
+            _isRunning = true;
             _composerThread.Start();
         }
 
@@ -295,8 +299,6 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
 
         private void HandleComposition()
         {
-            _isRunning = true;
-
             long lastTicks = PerformanceCounter.ElapsedTicks;
 
             while (_isRunning)
@@ -516,11 +518,46 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
 
         public void Dispose()
         {
+            if (Interlocked.Exchange(ref _disposeState, 1) != 0)
+            {
+                return;
+            }
+
+            RequestStop();
+
+            if (Thread.CurrentThread != _composerThread)
+            {
+                _composerThread.Join();
+            }
+
+            lock (_lock)
+            {
+                foreach (Layer layer in _layers.Values)
+                {
+                    layer.Core.PrepareForExit();
+                    HOSBinderDriverServer.UnregisterBinderObject(layer.ProducerBinderId);
+                }
+
+                _layers.Clear();
+                RenderLayerId = 0;
+            }
+
+            _event.Dispose();
+            _nextFrameEvent.Dispose();
+        }
+
+        public void RequestStop()
+        {
             _isRunning = false;
 
-            foreach (Layer layer in _layers.Values)
+            try
             {
-                layer.Core.PrepareForExit();
+                _event.Set();
+                _nextFrameEvent.Set();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Repeated stop requests after completed disposal are harmless.
             }
         }
 

@@ -156,15 +156,18 @@ namespace Ryujinx.Headless.SDL2.Vulkan
             return requiredExtensions.ToArray();
         }
 
-        protected override void FinalizeWindowRenderer()
+        protected override void FinalizeWindowRenderer(bool gpuDisposeSucceeded)
         {
-            if (_surfaceCreated)
+            if (gpuDisposeSucceeded && _surfaceCreated)
             {
                 _surface = default;
                 _surfaceCreated = false;
             }
-            
-            nativeMetalLayer = IntPtr.Zero;
+
+            if (gpuDisposeSucceeded)
+            {
+                nativeMetalLayer = IntPtr.Zero;
+            }
         }
 
 

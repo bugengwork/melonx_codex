@@ -21,10 +21,10 @@ class LaunchGameHandler: ObservableObject {
     
     private static let jitEntitlement = "com.apple.developer.kernel.increased-memory-limit"
     
-    private let ryujinx = Ryujinx.shared
+    @MainActor private lazy var ryujinx = Ryujinx.shared
     private let nativeSettings = NativeSettingsManager.shared
     private let settingsManager = SettingsManager.shared
-    private let persettings = PerGameSettingsManager.shared
+    @MainActor private lazy var persettings = PerGameSettingsManager.shared
     private let controllerManager = ControllerManager.shared
     
     private var config: Ryujinx.Arguments {
@@ -35,20 +35,24 @@ class LaunchGameHandler: ObservableObject {
         ProcessInfo.processInfo.isiOSAppOnMac ? true : checkAppEntitlement(Self.jitEntitlement)
     }
     
+    @MainActor
     var isGameReady: Bool {
         currentGame != nil
             && (nativeSettings.ignoreJIT.value ? true : ryujinx.jitenabled)
             && (nativeSettings.showProfileonGame.value ? profileSelected : true)
     }
     
+    @MainActor
     var shouldLaunchGame: Bool {
         isGameReady && hasJITEntitlement
     }
     
+    @MainActor
     var shouldShowEntitlement: Bool {
         isGameReady && !hasJITEntitlement
     }
     
+    @MainActor
     var shouldShowPopover: Bool {
         currentGame != nil
             && ryujinx.jitenabled
@@ -57,6 +61,7 @@ class LaunchGameHandler: ObservableObject {
             && hasJITEntitlement
     }
     
+    @MainActor
     var shouldCheckJIT: Bool {
         currentGame != nil
             && !ryujinx.jitenabled
@@ -66,6 +71,7 @@ class LaunchGameHandler: ObservableObject {
     
     
     
+    @MainActor
     func enableJIT() {
         ryujinx.checkForJIT()
         print("Has TXM? \(ProcessInfo.processInfo.hasTXM)")
@@ -85,11 +91,11 @@ class LaunchGameHandler: ObservableObject {
         }
     }
     
+    @MainActor
     func startGame() {
         enableJIT()
         MusicSelectorView.stopMusic()
         nativeSettings.isVirtualController.value = controllerManager.hasVirtualController()
-        MetalView.createView()
         
         guard let currentGame else { return }
         
@@ -112,6 +118,8 @@ class LaunchGameHandler: ObservableObject {
             try ryujinx.start(with: config)
         } catch {
             print("Failed to start game '\(currentGame.titleId)': \(error)")
+            self.currentGame = nil
+            showApp = true
         }
     }
     

@@ -5,6 +5,8 @@ using Ryujinx.Common.Logging;
 using Ryujinx.Graphics.OpenGL;
 using Ryujinx.Input.HLE;
 using System;
+using System.Runtime.ExceptionServices;
+using System.Threading;
 using static SDL2.SDL;
 
 namespace Ryujinx.Headless.SDL2.OpenGL
@@ -51,6 +53,7 @@ namespace Ryujinx.Headless.SDL2.OpenGL
             private readonly IntPtr _context;
             private readonly IntPtr _window;
             private readonly bool _shouldDisposeWindow;
+            private int _disposeState;
 
             public SDL2OpenGLContext(IntPtr context, IntPtr window, bool shouldDisposeWindow = true)
             {
@@ -66,15 +69,41 @@ namespace Ryujinx.Headless.SDL2.OpenGL
                 // Ensure we share our contexts.
                 SetupOpenGLAttributes(true, GraphicsDebugLevel.None);
                 IntPtr windowHandle = SDL_CreateWindow("Ryujinx background context window", 0, 0, 1, 1, SDL_WindowFlags.SDL_WINDOW_OPENGL | SDL_WindowFlags.SDL_WINDOW_HIDDEN);
-                IntPtr context = SDL_GL_CreateContext(windowHandle);
+                IntPtr context = IntPtr.Zero;
 
-                GL.LoadBindings(new OpenToolkitBindingsContext());
+                if (windowHandle == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException(
+                        $"SDL_CreateWindow failed with error \"{SDL_GetError()}\"");
+                }
 
-                CheckResult(SDL_GL_SetAttribute(SDL_GLattr.SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0));
+                try
+                {
+                    context = SDL_GL_CreateContext(windowHandle);
 
-                CheckResult(SDL_GL_MakeCurrent(windowHandle, IntPtr.Zero));
+                    if (context == IntPtr.Zero)
+                    {
+                        throw new InvalidOperationException(
+                            $"SDL_GL_CreateContext failed with error \"{SDL_GetError()}\"");
+                    }
 
-                return new SDL2OpenGLContext(context, windowHandle);
+                    GL.LoadBindings(new OpenToolkitBindingsContext());
+
+                    CheckResult(SDL_GL_SetAttribute(SDL_GLattr.SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0));
+                    CheckResult(SDL_GL_MakeCurrent(windowHandle, IntPtr.Zero));
+
+                    return new SDL2OpenGLContext(context, windowHandle);
+                }
+                catch
+                {
+                    if (context != IntPtr.Zero)
+                    {
+                        SDL_GL_DeleteContext(context);
+                    }
+
+                    SDL_DestroyWindow(windowHandle);
+                    throw;
+                }
             }
 
             public void MakeCurrent()
@@ -100,6 +129,11 @@ namespace Ryujinx.Headless.SDL2.OpenGL
 
             public void Dispose()
             {
+                if (Interlocked.Exchange(ref _disposeState, 1) != 0)
+                {
+                    return;
+                }
+
                 SDL_GL_DeleteContext(_context);
 
                 if (_shouldDisposeWindow)
@@ -130,7 +164,6 @@ namespace Ryujinx.Headless.SDL2.OpenGL
             // Ensure to not share this context with other contexts before this point.
             SetupOpenGLAttributes(false, _glLogLevel);
             IntPtr context = SDL_GL_CreateContext(WindowHandle);
-            CheckResult(SDL_GL_SetSwapInterval(1));
 
             if (context == IntPtr.Zero)
             {
@@ -143,6 +176,7 @@ namespace Ryujinx.Headless.SDL2.OpenGL
 
             // NOTE: The window handle needs to be disposed by the thread that created it and is handled separately.
             _openGLContext = new SDL2OpenGLContext(context, WindowHandle, false);
+            CheckResult(SDL_GL_SetSwapInterval(1));
 
             // First take exclusivity on the OpenGL context.
             ((OpenGLRenderer)Renderer).InitializeBackgroundContext(SDL2OpenGLContext.CreateBackgroundContext(_openGLContext));
@@ -182,16 +216,40 @@ namespace Ryujinx.Headless.SDL2.OpenGL
 
         protected override void InitializeRenderer() { }
 
-        protected override void FinalizeWindowRenderer()
+        protected override void PrepareForGpuDispose()
         {
-            // Try to bind the OpenGL context before calling the gpu disposal.
-            _openGLContext.MakeCurrent();
+            // Bind the OpenGL context before the unified render-thread GPU disposal.
+            _openGLContext?.MakeCurrent();
+        }
 
-            Device.DisposeGpu();
+        protected override void FinalizeWindowRenderer(bool gpuDisposeSucceeded)
+        {
+            if (_openGLContext != null)
+            {
+                SDL2OpenGLContext context = _openGLContext;
+                _openGLContext = null;
+                ExceptionDispatchInfo failure = null;
 
-            // Unbind context and destroy everything
-            CheckResult(SDL_GL_MakeCurrent(WindowHandle, IntPtr.Zero));
-            _openGLContext.Dispose();
+                try
+                {
+                    CheckResult(SDL_GL_MakeCurrent(WindowHandle, IntPtr.Zero));
+                }
+                catch (Exception exception)
+                {
+                    failure = ExceptionDispatchInfo.Capture(exception);
+                }
+
+                try
+                {
+                    context.Dispose();
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
+                }
+
+                failure?.Throw();
+            }
         }
 
         protected override void SwapBuffers()

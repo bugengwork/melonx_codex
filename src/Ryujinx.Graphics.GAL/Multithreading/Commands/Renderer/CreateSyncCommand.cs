@@ -14,9 +14,14 @@ namespace Ryujinx.Graphics.GAL.Multithreading.Commands.Renderer
 
         public static void Run(ref CreateSyncCommand command, ThreadedRenderer threaded, IRenderer renderer)
         {
-            renderer.CreateSync(command._id, command._strict);
-
-            threaded.Sync.AssignSync(command._id);
+            try
+            {
+                renderer.CreateSync(command._id, command._strict);
+            }
+            finally
+            {
+                threaded.Sync.AssignSync(command._id);
+            }
         }
     }
 }

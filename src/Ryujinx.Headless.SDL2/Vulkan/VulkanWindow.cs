@@ -102,11 +102,6 @@ namespace Ryujinx.Headless.SDL2.Vulkan
             throw new Exception(errorMessage);
         }
 
-        protected override void FinalizeWindowRenderer()
-        {
-            Device.DisposeGpu();
-        }
-
         protected override void SwapBuffers() { }
     }
 }

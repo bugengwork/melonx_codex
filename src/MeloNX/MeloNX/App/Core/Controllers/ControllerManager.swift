@@ -16,6 +16,8 @@ class ControllerManager: ObservableObject {
     @AppStorage("isVirtualController") var isVCA: Bool = true
     
     private let controllerQueue = DispatchQueue(label: "com.stossy11.melonx.controllermanager", attributes: .concurrent)
+    private let observerLock = NSLock()
+    private var controllerObserverTokens: [NSObjectProtocol] = []
     
     private var _privAllControllers: [BaseController] = []
     @Published var allControllers: [BaseController] = []
@@ -123,41 +125,6 @@ class ControllerManager: ObservableObject {
         }
     }
 
-    func registerRemoteController(_ controller: RemoteController) {
-        controllerQueue.async(flags: .barrier) { [weak self] in
-            guard let self = self else { return }
-            guard !self._privAllControllers.contains(where: { $0 === controller }) else { return }
-
-            self._privAllControllers.append(controller)
-
-            DispatchQueue.main.async {
-                self.allControllers = self._privAllControllers
-                if !self.selectedControllers.contains(controller.id) {
-                    self.selectedControllers.append(controller.id)
-                }
-                if Ryujinx.shared.isRunning {
-                    Ryujinx.shared.reloadControllersWithInfo()
-                }
-            }
-        }
-    }
-
-    func unregisterRemoteController(_ controller: RemoteController) {
-        controllerQueue.async(flags: .barrier) { [weak self] in
-            guard let self = self else { return }
-            controller.cleanup()
-            self._privAllControllers.removeAll { $0 === controller }
-
-            DispatchQueue.main.async {
-                self.allControllers = self._privAllControllers
-                self.selectedControllers.removeAll { $0 == controller.id }
-                if Ryujinx.shared.isRunning {
-                    Ryujinx.shared.reloadControllersWithInfo()
-                }
-            }
-        }
-    }
-    
     func firstControllerForName(_ name: String) -> BaseController? {
         return controllerQueue.sync {
             return _privAllControllers.first(where: { $0.nativeController?.vendorName ?? UUID().uuidString == name })
@@ -171,7 +138,14 @@ class ControllerManager: ObservableObject {
     }
     
     func initControllerObservers() {
-        NotificationCenter.default.addObserver(
+        observerLock.lock()
+        defer { observerLock.unlock() }
+
+        guard controllerObserverTokens.isEmpty else {
+            return
+        }
+
+        let connectToken = NotificationCenter.default.addObserver(
             forName: .GCControllerDidConnect,
             object: nil,
             queue: .main
@@ -183,7 +157,7 @@ class ControllerManager: ObservableObject {
             }
         }
         
-        NotificationCenter.default.addObserver(
+        let disconnectToken = NotificationCenter.default.addObserver(
             forName: .GCControllerDidDisconnect,
             object: nil,
             queue: .main
@@ -194,6 +168,8 @@ class ControllerManager: ObservableObject {
                 self.refreshControllersList()
             }
         }
+
+        controllerObserverTokens = [connectToken, disconnectToken]
     }
     
     func toggleController(_ baseController: BaseController) {

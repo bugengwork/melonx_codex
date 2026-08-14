@@ -26,12 +26,55 @@ struct iOSNav<Content: View>: View {
     }
 }
 
+@MainActor
 class Ryujinx : ObservableObject {
+    enum EmulationState: String, CaseIterable, Hashable {
+        case idle
+        case starting
+        case running
+        case stopping
+        case failed
+
+        var allowsStart: Bool {
+            self == .idle
+        }
+
+        func canTransition(to newState: EmulationState) -> Bool {
+            switch (self, newState) {
+            case (.idle, .starting),
+                 (.starting, .running),
+                 (.starting, .stopping),
+                 (.starting, .failed),
+                 (.starting, .idle),
+                 (.running, .stopping),
+                 (.running, .failed),
+                 (.running, .idle),
+                 (.stopping, .failed),
+                 (.stopping, .idle),
+                 (.failed, .idle):
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
     // Models
-    @Published var isRunning = false
+    @Published private(set) var state: EmulationState = .idle
     @Published var showLoading = true
     @Published var jitenabled = false
     @Published var isPortrait = false
+
+    var isRunning: Bool {
+        switch state {
+        case .starting, .running, .stopping:
+            return true
+        case .failed:
+            return runner.isActive
+        case .idle:
+            return false
+        }
+    }
     
     // LDN and Firmware
     @AppStorage("LDN_MITM") var ldn = printAllIPv4Addresses().first ?? "Unknown"
@@ -54,7 +97,13 @@ class Ryujinx : ObservableObject {
     let controllerManager = ControllerManager.shared
     
     // Ryujinx Thread
-    var runner = Runner()
+    private let runner = Runner()
+    private var activeRunID: UUID?
+    private var activeSecurityScopedURL: URL?
+    private var stopWatchdog: Task<Void, Never>?
+    private var cleanupFailureAlert: UIAlertController?
+    private var executionFailureTask: Task<Void, Never>?
+    private var lastFailedRunID: UUID?
     
     static let shared = Ryujinx()
     
@@ -65,11 +114,6 @@ class Ryujinx : ObservableObject {
     func addGames() {
         self.games = loadGames()
     }
-    
-    func runloop(_ cool: @escaping () -> Void) {
-        runner.start(cool)
-    }
-    
     
     public class Arguments : Observable, Codable, Equatable {
         @IgnoreCoding var gamepath: String = ""
@@ -127,78 +171,206 @@ class Ryujinx : ObservableObject {
     
     
     func start(with config: Arguments) throws {
-        guard !isRunning else {
+        guard state.allowsStart, !runner.isActive else {
             throw RyujinxError.alreadyRunning
         }
-        
-        
+
+        let runID = UUID()
+        let args = buildCommandLineArgs(from: config)
+        let gameURL = URL(fileURLWithPath: config.gamepath)
+        let isAccessingSecurityScopedResource = gameURL.startAccessingSecurityScopedResource()
+
         self.config = config
-        
-        self.isRunning = true
-        
-        
-        runloop { [self] in
-            let url = URL(string: config.gamepath)
-            
+        activeRunID = runID
+        activeSecurityScopedURL = isAccessingSecurityScopedResource ? gameURL : nil
+        executionFailureTask?.cancel()
+        executionFailureTask = nil
+        lastFailedRunID = nil
+        transition(to: .starting, reason: "start requested")
+        MetalView.createView()
+        RyujinxBridge.prepareEmulationStart()
+
+        let didStart = runner.start(
+            operation: {
+                RyujinxBridge.mainRyu(argv: args)
+            },
+            completion: { [weak self] result in
+                self?.completeRun(runID: runID, result: result)
+            }
+        )
+
+        guard didStart else {
+            RyujinxBridge.cancelEmulationStart()
+            releaseSecurityScopedResource()
+            emulationUIView = nil
+            metalLayer = nil
+            activeRunID = nil
+            transition(to: .idle, reason: "runner rejected start", runID: runID)
+            throw RyujinxError.alreadyRunning
+        }
+
+        transition(to: .running, reason: "mainRyu dispatched")
+    }
+
+    private func completeRun(runID: UUID, result: Int) {
+        guard activeRunID == runID else {
+            return
+        }
+
+        stopWatchdog?.cancel()
+        stopWatchdog = nil
+
+        if result == RyujinxBridge.teardownIncompleteResult {
+            if state != .failed {
+                transition(
+                    to: .failed,
+                    reason: "native teardown did not complete",
+                    runID: runID
+                )
+            }
+
+            presentCleanupFailureAlert(
+                title: "Emulation Cleanup Did Not Complete",
+                message: "Native cleanup could not finish safely. Restart MeloNX before launching another game."
+            )
+            return
+        }
+
+        dismissCleanupFailureAlert()
+
+        releaseSecurityScopedResource()
+        emulationUIView = nil
+        metalLayer = nil
+        UIApplication.shared.isIdleTimerDisabled = false
+        UserDefaults.standard.set(false, forKey: "lockInApp")
+        activeRunID = nil
+
+        transition(
+            to: .idle,
+            reason: "mainRyu completed with code \(result)",
+            runID: runID
+        )
+
+        if result != 0 {
+            lastFailedRunID = runID
+            presentExecutionFailure(runID: runID)
+        }
+    }
+
+    private func releaseSecurityScopedResource() {
+        activeSecurityScopedURL?.stopAccessingSecurityScopedResource()
+        activeSecurityScopedURL = nil
+    }
+
+    private func transition(
+        to newState: EmulationState,
+        reason: String,
+        runID: UUID? = nil
+    ) {
+        let oldState = state
+
+        guard oldState.canTransition(to: newState) else {
+            print(
+                "[EmulationLifecycle] Rejected invalid transition "
+                    + "\(oldState.rawValue) -> \(newState.rawValue): \(reason)"
+            )
+            return
+        }
+
+        state = newState
+        print("[EmulationLifecycle] \(oldState.rawValue) -> \(newState.rawValue): \(reason)")
+        MemoryUsageMonitor.logPhysicalFootprint(
+            sessionID: runID ?? activeRunID,
+            stage: "\(oldState.rawValue)->\(newState.rawValue)"
+        )
+    }
+
+    private func startStopWatchdog(runID: UUID) {
+        stopWatchdog?.cancel()
+        stopWatchdog = Task { [weak self] in
             do {
-                let args = self.buildCommandLineArgs(from: config)
-                let accessing = url?.startAccessingSecurityScopedResource()
-                
-                // Start the emulation
-                if isRunning {
-                    let result = RyujinxBridge.mainRyu(argv: args)//main_ryujinx_sdl(Int32(args.count), &argvPtrs)
-                    
-                    if result != 0 {
-                        Task { @MainActor in
-                            self.isRunning = false
-                        }
-                        if let accessing, accessing {
-                            url!.stopAccessingSecurityScopedResource()
-                        }
-                        
-                        throw RyujinxError.executionError(code: Int32(result))
-                    }
-                }
+                try await Task.sleep(nanoseconds: 30_000_000_000)
             } catch {
-                Task { @MainActor in
-                    self.isRunning = false
-                }
-                
-                Thread.sleep(forTimeInterval: 0.3)
-                let logs = LogCapture.shared.capturedLogs
-                let parsedLogs = extractExceptionInfo(logs)
-                if let parsedLogs {
-                    Task { @MainActor in
-                        let result = Array(logs.suffix(from: parsedLogs.lineIndex))
-                        
-                        let dateFormatter = DateFormatter()
-                        dateFormatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-                        let currentDate = Date()
-                        let dateString = dateFormatter.string(from: currentDate)
-                        let path = URL.documentsDirectory.appendingPathComponent("StackTrace").appendingPathComponent("StackTrace-\(dateString).txt").path
-                        
-                        self.saveArrayAsTextFile(strings: result, filePath: path)
-                        
-                        
-                        presentAlert(title: "MeloNX Crashed!", message: parsedLogs.exceptionType + ": " + parsedLogs.message, imageName: "sad_mac") {
-                            UIApplication.shared.perform(#selector(NSXPCConnection.suspend))
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                                exit(0)
-                            }
-                        }
-                    }
-                } else {
-                    Task { @MainActor in
-                        presentAlert(title: "MeloNX Crashed!", message:  "Unknown Error", imageName: "sad_mac") {
-                            UIApplication.shared.perform(#selector(NSXPCConnection.suspend))
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                                exit(0)
-                            }
-                        }
-                    }
-                }
+                return
+            }
+
+            guard let self,
+                  self.activeRunID == runID,
+                  self.runner.isActive,
+                  self.state == .stopping else {
+                return
+            }
+
+            self.transition(to: .failed, reason: "stop timed out after 30 seconds")
+            self.presentCleanupFailureAlert(
+                title: "Emulation Cleanup Timed Out",
+                message: "Cleanup has not completed. Restart MeloNX before launching another game."
+            )
+        }
+    }
+
+    private func presentCleanupFailureAlert(title: String, message: String) {
+        guard cleanupFailureAlert == nil,
+              let rootViewController = AppDelegate.window?.rootViewController else {
+            return
+        }
+
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        cleanupFailureAlert = alert
+        rootViewController.present(alert, animated: true)
+    }
+
+    private func dismissCleanupFailureAlert() {
+        guard let alert = cleanupFailureAlert else {
+            return
+        }
+
+        cleanupFailureAlert = nil
+        alert.dismiss(animated: true)
+    }
+
+    private func presentExecutionFailure(runID: UUID) {
+        executionFailureTask?.cancel()
+        executionFailureTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 300_000_000)
+            } catch {
+                return
+            }
+
+            guard let self,
+                  self.activeRunID == nil,
+                  self.lastFailedRunID == runID,
+                  self.state == .idle else {
+                return
+            }
+
+            self.executionFailureTask = nil
+            self.lastFailedRunID = nil
+            let logs = LogCapture.shared.capturedLogs
+            let parsedLogs = self.extractExceptionInfo(logs)
+
+            if let parsedLogs {
+                let result = Array(logs.suffix(from: parsedLogs.lineIndex))
+                let dateFormatter = DateFormatter()
+                dateFormatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+                let dateString = dateFormatter.string(from: Date())
+                let path = URL.documentsDirectory
+                    .appendingPathComponent("StackTrace")
+                    .appendingPathComponent("StackTrace-\(dateString).txt")
+                    .path
+
+                self.saveArrayAsTextFile(strings: result, filePath: path)
+                presentCrashAlert(message: parsedLogs.exceptionType + ": " + parsedLogs.message)
+            } else {
+                presentCrashAlert(message: "Unknown Error")
             }
         }
+    }
+
+    private func presentCrashAlert(message: String) {
+        presentAlert(title: "MeloNX Execution Failed", message: message, imageName: "sad_mac")
     }
     
     func saveArrayAsTextFile(strings: [String], filePath: String) {
@@ -294,18 +466,25 @@ class Ryujinx : ObservableObject {
     
     
     func stop() throws {
-        guard isRunning else {
+        guard let runID = activeRunID, runner.isActive else {
             throw RyujinxError.notRunning
         }
-        
-        isRunning = false
-        
-        UserDefaults.standard.set(false, forKey: "lockInApp")
-        
-        self.emulationUIView = nil
-        self.metalLayer = nil
-        
-        
+
+        switch state {
+        case .starting, .running:
+            transition(to: .stopping, reason: "stop requested")
+            UserDefaults.standard.set(false, forKey: "lockInApp")
+            RyujinxBridge.stopEmulation()
+            startStopWatchdog(runID: runID)
+        case .stopping:
+            RyujinxBridge.stopEmulation()
+        case .failed:
+            // A watchdog failure still owns a live native run. A repeated stop
+            // request is safe, but resources remain retained until completion.
+            RyujinxBridge.stopEmulation()
+        case .idle:
+            throw RyujinxError.notRunning
+        }
     }
     
     
@@ -656,8 +835,11 @@ class Ryujinx : ObservableObject {
         return false
     }
     
-    func checkForJIT() {
-        jitenabled = isJITEnabled()
+    nonisolated func checkForJIT() {
+        let isEnabled = isJITEnabled()
+        Task { @MainActor [weak self] in
+            self?.jitenabled = isEnabled
+        }
     }
 }
 

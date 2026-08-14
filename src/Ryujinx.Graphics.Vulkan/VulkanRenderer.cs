@@ -10,7 +10,9 @@ using Silk.NET.Vulkan.Extensions.EXT;
 using Silk.NET.Vulkan.Extensions.KHR;
 using System;
 using System.Collections.Generic;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 using Format = Ryujinx.Graphics.GAL.Format;
 using PrimitiveTopology = Ryujinx.Graphics.GAL.PrimitiveTopology;
 using SamplerCreateInfo = Ryujinx.Graphics.GAL.SamplerCreateInfo;
@@ -19,6 +21,19 @@ namespace Ryujinx.Graphics.Vulkan
 {
     public sealed class VulkanRenderer : IRenderer
     {
+        private const int DisposeActive = 0;
+        private const int DisposeInProgress = 1;
+        private const int DisposeComplete = 2;
+
+        private static int _initializeSequence;
+        private static int _disposeSequence;
+        private static long _instanceCreatedCount;
+        private static long _instanceDestroyedCount;
+        private static long _surfaceCreatedCount;
+        private static long _surfaceDestroyedCount;
+        private static long _deviceCreatedCount;
+        private static long _deviceDestroyedCount;
+
         private VulkanInstance _instance;
         private SurfaceKHR _surface;
         private VulkanPhysicalDevice _physicalDevice;
@@ -26,6 +41,9 @@ namespace Ryujinx.Graphics.Vulkan
         private WindowBase _window;
 
         private bool _initialized;
+        private int _disposeState;
+        private readonly VulkanInitializationLifecycle _initializationLifecycle;
+        private readonly object _lifecycleLock = new();
 
         internal FormatCapabilities FormatCapabilities { get; private set; }
         internal HardwareCapabilities Capabilities;
@@ -98,15 +116,35 @@ namespace Ryujinx.Graphics.Vulkan
         public string GpuRenderer { get; private set; }
         public string GpuVersion { get; private set; }
 
+        public static long InstanceCreatedCount => Interlocked.Read(ref _instanceCreatedCount);
+        public static long InstanceDestroyedCount => Interlocked.Read(ref _instanceDestroyedCount);
+        public static long SurfaceCreatedCount => Interlocked.Read(ref _surfaceCreatedCount);
+        public static long SurfaceDestroyedCount => Interlocked.Read(ref _surfaceDestroyedCount);
+        public static long DeviceCreatedCount => Interlocked.Read(ref _deviceCreatedCount);
+        public static long DeviceDestroyedCount => Interlocked.Read(ref _deviceDestroyedCount);
+        public static long ValidationErrorCount => VulkanDebugMessenger.ValidationErrorCount;
+        public static long DeviceLostCount => ResultExtensions.DeviceLostCount;
+
         public bool PreferThreading => true;
 
         public event EventHandler<ScreenCaptureImageInfo> ScreenCaptured;
 
         public VulkanRenderer(Vk api, Func<Instance, Vk, SurfaceKHR> surfaceFunc, Func<string[]> requiredExtensionsFunc, string preferredGpuId)
+            : this(api, surfaceFunc, requiredExtensionsFunc, preferredGpuId, null)
+        {
+        }
+
+        internal VulkanRenderer(
+            Vk api,
+            Func<Instance, Vk, SurfaceKHR> surfaceFunc,
+            Func<string[]> requiredExtensionsFunc,
+            string preferredGpuId,
+            Action<VulkanInitializationStage> initializationFaultInjector)
         {
             _getSurface = surfaceFunc;
             _getRequiredExtensions = requiredExtensionsFunc;
             _preferredGpuId = preferredGpuId;
+            _initializationLifecycle = new VulkanInitializationLifecycle(initializationFaultInjector);
             Api = api;
             Shaders = new HashSet<ShaderCollection>();
             Textures = new HashSet<ITexture>();
@@ -444,9 +482,8 @@ namespace Ryujinx.Graphics.Vulkan
                 properties.Limits.SubTexelPrecisionBits,
                 minResourceAlignment);
 
-            IsSharedMemory = MemoryAllocator.IsDeviceMemoryShared(_physicalDevice);
-
             MemoryAllocator = new MemoryAllocator(Api, _physicalDevice, _device);
+            IsSharedMemory = MemoryAllocator.IsDeviceMemoryShared(_physicalDevice);
 
             Api.TryGetDeviceExtension(_instance.Instance, _device, out ExtExternalMemoryHost hostMemoryApi);
             HostMemoryAllocator = new HostMemoryAllocator(MemoryAllocator, Api, hostMemoryApi, _device);
@@ -472,24 +509,60 @@ namespace Ryujinx.Graphics.Vulkan
 
         private void SetupContext(GraphicsDebugLevel logLevel)
         {
+            _initializationLifecycle.BeginStage(
+                VulkanInitializationStage.Instance,
+                DestroyInstanceStage);
+
             _instance = VulkanInitialization.CreateInstance(Api, logLevel, _getRequiredExtensions());
+            Interlocked.Increment(ref _instanceCreatedCount);
+            _initializationLifecycle.CompleteStage(VulkanInitializationStage.Instance);
+
             _debugMessenger = new VulkanDebugMessenger(Api, _instance.Instance, logLevel);
 
             if (Api.TryGetInstanceExtension(_instance.Instance, out KhrSurface surfaceApi))
             {
                 SurfaceApi = surfaceApi;
             }
+            else
+            {
+                throw new NotSupportedException("The Vulkan surface extension is unavailable.");
+            }
+
+            _initializationLifecycle.BeginStage(
+                VulkanInitializationStage.Surface,
+                DestroySurfaceStage);
 
             _surface = _getSurface(_instance.Instance, Api);
+            if (_surface.Handle != 0)
+            {
+                Interlocked.Increment(ref _surfaceCreatedCount);
+            }
+
+            _initializationLifecycle.CompleteStage(VulkanInitializationStage.Surface);
+
             _physicalDevice = VulkanInitialization.FindSuitablePhysicalDevice(Api, _instance, _surface, _preferredGpuId);
 
             var queueFamilyIndex = VulkanInitialization.FindSuitableQueueFamily(Api, _physicalDevice, _surface, out uint maxQueueCount);
 
+            _initializationLifecycle.BeginStage(
+                VulkanInitializationStage.Device,
+                DestroyDeviceStage);
+
             _device = VulkanInitialization.CreateDevice(Api, _physicalDevice, queueFamilyIndex, maxQueueCount);
+            if (_device.Handle != 0)
+            {
+                Interlocked.Increment(ref _deviceCreatedCount);
+            }
+
+            _initializationLifecycle.CompleteStage(VulkanInitializationStage.Device);
 
             if (Api.TryGetDeviceExtension(_instance.Instance, _device, out KhrSwapchain swapchainApi))
             {
                 SwapchainApi = swapchainApi;
+            }
+            else
+            {
+                throw new NotSupportedException("The Vulkan swapchain extension is unavailable.");
             }
 
             Api.GetDeviceQueue(_device, queueFamilyIndex, 0, out var queue);
@@ -500,7 +573,16 @@ namespace Ryujinx.Graphics.Vulkan
 
             QueueFamilyIndex = queueFamilyIndex;
 
-            _window = new Window(this, _surface, _physicalDevice.PhysicalDevice, _device);
+            // Register before Initialize so a partial swapchain can always be
+            // disposed by the same rollback path.
+            _initializationLifecycle.BeginStage(
+                VulkanInitializationStage.Swapchain,
+                DestroySwapchainStage);
+
+            var window = new Window(this, _surface, _physicalDevice.PhysicalDevice, _device);
+            _window = window;
+            window.Initialize();
+            _initializationLifecycle.CompleteStage(VulkanInitializationStage.Swapchain);
 
             _initialized = true;
         }
@@ -899,9 +981,61 @@ namespace Ryujinx.Graphics.Vulkan
 
         public void Initialize(GraphicsDebugLevel logLevel)
         {
-            SetupContext(logLevel);
+            lock (_lifecycleLock)
+            {
+                if (Volatile.Read(ref _disposeState) != DisposeActive)
+                {
+                    throw new ObjectDisposedException(nameof(VulkanRenderer));
+                }
 
-            PrintGpuInformation();
+                if (_initialized)
+                {
+                    throw new InvalidOperationException("The Vulkan renderer has already been initialized.");
+                }
+
+                int initializeId = Interlocked.Increment(ref _initializeSequence);
+
+                Logger.Debug?.Print(
+                    LogClass.Gpu,
+                    $"Vulkan renderer Initialize #{initializeId} starting on managed thread {Environment.CurrentManagedThreadId}. {GetLifecycleCounterSnapshot()}");
+
+                try
+                {
+                    SetupContext(logLevel);
+                    PrintGpuInformation();
+
+                    Logger.Debug?.Print(
+                        LogClass.Gpu,
+                        $"Vulkan renderer Initialize #{initializeId} completed on managed thread {Environment.CurrentManagedThreadId}. {GetLifecycleCounterSnapshot()}");
+                }
+                catch (Exception exception)
+                {
+                    Volatile.Write(ref _disposeState, DisposeInProgress);
+
+                    ExceptionDispatchInfo cleanupException = null;
+                    DisposeCore(ref cleanupException);
+
+                    _initialized = false;
+                    Volatile.Write(ref _disposeState, DisposeComplete);
+
+                    Logger.Warning?.Print(
+                        LogClass.Gpu,
+                        $"Vulkan renderer Initialize #{initializeId} failed on managed thread {Environment.CurrentManagedThreadId}: {exception.Message}. {GetLifecycleCounterSnapshot()}");
+
+                    if (cleanupException != null)
+                    {
+                        Logger.Warning?.Print(
+                            LogClass.Gpu,
+                            $"Vulkan renderer initialization rollback also failed: {cleanupException.SourceException.Message}");
+
+                        throw new VulkanRendererInitializationRollbackException(
+                            exception,
+                            cleanupException.SourceException);
+                    }
+
+                    throw;
+                }
+            }
         }
 
         internal bool NeedsVertexBufferAlignment(int attrScalarAlignment, out int alignment)
@@ -1010,46 +1144,220 @@ namespace Ryujinx.Graphics.Vulkan
 
         public unsafe void Dispose()
         {
-            if (!_initialized)
+            lock (_lifecycleLock)
+            {
+                if (Volatile.Read(ref _disposeState) != DisposeActive)
+                {
+                    return;
+                }
+
+                Volatile.Write(ref _disposeState, DisposeInProgress);
+
+                int disposeId = Interlocked.Increment(ref _disposeSequence);
+
+                Logger.Debug?.Print(
+                    LogClass.Gpu,
+                    $"Vulkan renderer Dispose #{disposeId} starting on managed thread {Environment.CurrentManagedThreadId}. {GetLifecycleCounterSnapshot()}");
+
+                ExceptionDispatchInfo firstException = null;
+
+                try
+                {
+                    DisposeCore(ref firstException);
+                }
+                finally
+                {
+                    _initialized = false;
+                    Volatile.Write(ref _disposeState, DisposeComplete);
+
+                    Logger.Debug?.Print(
+                        LogClass.Gpu,
+                        $"Vulkan renderer Dispose #{disposeId} completed on managed thread {Environment.CurrentManagedThreadId}. {GetLifecycleCounterSnapshot()}");
+                }
+
+                firstException?.Throw();
+            }
+        }
+
+        private unsafe void DisposeCore(ref ExceptionDispatchInfo firstException)
+        {
+            List<ShaderCollection> shaders = new(Shaders);
+
+            // Background compilation can create pipelines and use PipelineCache
+            // after shader modules have finished compiling. Make every host task
+            // terminal before waiting for the device or destroying any child.
+            foreach (ShaderCollection shader in shaders)
+            {
+                CaptureException(shader.WaitForBackgroundCompilation, ref firstException);
+            }
+
+            Device device = _device;
+
+            if (device.Handle != 0)
+            {
+                // All device children below may still be referenced by the final
+                // submission/present. Quiesce the device before destroying any of them.
+                CaptureException(() => Api.DeviceWaitIdle(device).ThrowOnError(), ref firstException);
+            }
+
+            CommandBufferPool commandBufferPool = CommandBufferPool;
+            CommandBufferPool = null;
+            CaptureException(() => commandBufferPool?.Dispose(), ref firstException);
+
+            BackgroundResources backgroundResources = BackgroundResources;
+            BackgroundResources = null;
+            CaptureException(() => backgroundResources?.Dispose(), ref firstException);
+
+            Counters counters = _counters;
+            _counters = null;
+            CaptureException(() => counters?.Dispose(), ref firstException);
+
+            _initializationLifecycle.ReleaseStage(
+                VulkanInitializationStage.Swapchain,
+                ref firstException);
+
+            HelperShader helperShader = HelperShader;
+            HelperShader = null;
+            CaptureException(() => helperShader?.Dispose(), ref firstException);
+
+            PipelineFull pipeline = _pipeline;
+            _pipeline = null;
+            CaptureException(() => pipeline?.Dispose(), ref firstException);
+
+            foreach (ShaderCollection shader in shaders)
+            {
+                CaptureException(shader.Dispose, ref firstException);
+            }
+
+            Shaders.Clear();
+
+            foreach (ITexture texture in new List<ITexture>(Textures))
+            {
+                CaptureException(texture.Release, ref firstException);
+            }
+
+            Textures.Clear();
+
+            foreach (SamplerHolder sampler in new List<SamplerHolder>(Samplers))
+            {
+                CaptureException(sampler.Dispose, ref firstException);
+            }
+
+            Samplers.Clear();
+
+            BufferManager bufferManager = BufferManager;
+            BufferManager = null;
+            CaptureException(() => bufferManager?.Dispose(), ref firstException);
+
+            PipelineLayoutCache pipelineLayoutCache = PipelineLayoutCache;
+            PipelineLayoutCache = null;
+            CaptureException(() => pipelineLayoutCache?.Dispose(), ref firstException);
+
+            BarrierBatch barriers = Barriers;
+            Barriers = null;
+            CaptureException(() => barriers?.Dispose(), ref firstException);
+
+            MemoryAllocator memoryAllocator = MemoryAllocator;
+            MemoryAllocator = null;
+            HostMemoryAllocator = null;
+            CaptureException(() => memoryAllocator?.Dispose(), ref firstException);
+
+            _initializationLifecycle.Rollback(ref firstException);
+
+            _physicalDevice = default;
+            Queue = default;
+            BackgroundQueue = default;
+            QueueLock = null;
+            BackgroundQueueLock = null;
+            SyncManager = null;
+
+            SurfaceApi = null;
+            SwapchainApi = null;
+            ConditionalRenderingApi = null;
+            ExtendedDynamicStateApi = null;
+            PushDescriptorApi = null;
+            TransformFeedbackApi = null;
+            DrawIndirectCountApi = null;
+            DynamicFeedbackLoopApi = null;
+        }
+
+        private string GetLifecycleCounterSnapshot()
+        {
+            return $"Vulkan lifecycle stage={_initializationLifecycle.CurrentStage}; totals: instance={InstanceCreatedCount}/{InstanceDestroyedCount}, " +
+                   $"surface={SurfaceCreatedCount}/{SurfaceDestroyedCount}, " +
+                   $"device={DeviceCreatedCount}/{DeviceDestroyedCount}.";
+        }
+
+        private void DestroySwapchainStage()
+        {
+            WindowBase window = _window;
+            _window = null;
+            window?.Dispose();
+        }
+
+        private unsafe void DestroyDeviceStage()
+        {
+            Device device = _device;
+            _device = default;
+
+            if (device.Handle != 0)
+            {
+                Api.DestroyDevice(device, null);
+                Interlocked.Increment(ref _deviceDestroyedCount);
+            }
+        }
+
+        private unsafe void DestroySurfaceStage()
+        {
+            VulkanInstance instance = _instance;
+            KhrSurface surfaceApi = SurfaceApi;
+            SurfaceKHR surface = _surface;
+            _surface = default;
+
+            if (instance != null && surfaceApi != null && surface.Handle != 0)
+            {
+                surfaceApi.DestroySurface(instance.Instance, surface, null);
+                Interlocked.Increment(ref _surfaceDestroyedCount);
+            }
+        }
+
+        private void DestroyInstanceStage()
+        {
+            VulkanDebugMessenger debugMessenger = _debugMessenger;
+            VulkanInstance instance = _instance;
+
+            _debugMessenger = null;
+            _instance = null;
+
+            ExceptionDispatchInfo firstException = null;
+            CaptureException(() => debugMessenger?.Dispose(), ref firstException);
+            CaptureException(() =>
+            {
+                if (instance != null)
+                {
+                    instance.Dispose();
+                    Interlocked.Increment(ref _instanceDestroyedCount);
+                }
+            }, ref firstException);
+
+            firstException?.Throw();
+        }
+
+        private static void CaptureException(Action action, ref ExceptionDispatchInfo firstException)
+        {
+            if (action == null)
             {
                 return;
             }
 
-            CommandBufferPool.Dispose();
-            BackgroundResources.Dispose();
-            _counters.Dispose();
-            _window.Dispose();
-            HelperShader.Dispose();
-            _pipeline.Dispose();
-            BufferManager.Dispose();
-            PipelineLayoutCache.Dispose();
-            Barriers.Dispose();
-
-            MemoryAllocator.Dispose();
-
-            foreach (var shader in Shaders)
+            try
             {
-                shader.Dispose();
+                action();
             }
-
-            foreach (var texture in Textures)
+            catch (Exception exception)
             {
-                texture.Release();
+                firstException ??= ExceptionDispatchInfo.Capture(exception);
             }
-
-            foreach (var sampler in Samplers)
-            {
-                sampler.Dispose();
-            }
-
-            SurfaceApi.DestroySurface(_instance.Instance, _surface, null);
-
-            Api.DestroyDevice(_device, null);
-
-            _debugMessenger.Dispose();
-
-            // Last step destroy the instance
-            _instance.Dispose();
         }
 
         public bool PrepareHostMapping(nint address, ulong size)

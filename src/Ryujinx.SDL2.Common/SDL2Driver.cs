@@ -46,59 +46,79 @@ namespace Ryujinx.SDL2.Common
         {
             lock (_lock)
             {
-                _refereceCount++;
-
                 if (_isRunning)
                 {
+                    _refereceCount++;
                     return;
                 }
 
-                SDL_SetHint(SDL_HINT_APP_NAME, "MeloNX");
-                SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
-                SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
-                SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
-                SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH_HOME_LED, "0");
-                SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_JOY_CONS, "1");
-                SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
+                bool initializationAttempted = false;
 
-
-                // NOTE: As of SDL2 2.24.0, joycons are combined by default but the motion source only come from one of them.
-                // We disable this behavior for now.
-                SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_COMBINE_JOY_CONS, "0");
-
-                if (SDL_Init(SdlInitFlags) != 0)
+                try
                 {
-                    string errorMessage = $"SDL2 initialization failed with error \"{SDL_GetError()}\"";
+                    SDL_SetHint(SDL_HINT_APP_NAME, "MeloNX");
+                    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
+                    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
+                    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+                    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH_HOME_LED, "0");
+                    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_JOY_CONS, "1");
+                    SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
 
-                    Logger.Error?.Print(LogClass.Application, errorMessage);
+                    // NOTE: As of SDL2 2.24.0, joycons are combined by default but the motion source only come from one of them.
+                    // We disable this behavior for now.
+                    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_COMBINE_JOY_CONS, "0");
 
-                    throw new Exception(errorMessage);
+                    initializationAttempted = true;
+
+                    if (SDL_Init(SdlInitFlags) != 0)
+                    {
+                        string errorMessage = $"SDL2 initialization failed with error \"{SDL_GetError()}\"";
+
+                        Logger.Error?.Print(LogClass.Application, errorMessage);
+
+                        throw new Exception(errorMessage);
+                    }
+
+                    // First ensure that we only enable joystick events (for connected/disconnected).
+                    if (SDL_GameControllerEventState(SDL_IGNORE) != SDL_IGNORE)
+                    {
+                        Logger.Error?.PrintMsg(LogClass.Application, "Couldn't change the state of game controller events.");
+                    }
+
+                    if (SDL_JoystickEventState(SDL_ENABLE) < 0)
+                    {
+                        Logger.Error?.PrintMsg(LogClass.Application, $"Failed to enable joystick event polling: {SDL_GetError()}");
+                    }
+
+                    // Disable all joysticks information, we don't need them no need to flood the event queue for that.
+                    SDL_EventState(SDL_EventType.SDL_JOYAXISMOTION, SDL_DISABLE);
+                    SDL_EventState(SDL_EventType.SDL_JOYBALLMOTION, SDL_DISABLE);
+                    SDL_EventState(SDL_EventType.SDL_JOYHATMOTION, SDL_DISABLE);
+                    SDL_EventState(SDL_EventType.SDL_JOYBUTTONDOWN, SDL_DISABLE);
+                    SDL_EventState(SDL_EventType.SDL_JOYBUTTONUP, SDL_DISABLE);
+
+                    SDL_EventState(SDL_EventType.SDL_CONTROLLERSENSORUPDATE, SDL_DISABLE);
+
+                    _registeredWindowHandlers = new ConcurrentDictionary<uint, Action<SDL_Event>>();
+                    _worker = new Thread(EventWorker);
+                    Volatile.Write(ref _isRunning, true);
+                    _worker.Start();
+                    _refereceCount = 1;
                 }
-
-                // First ensure that we only enable joystick events (for connected/disconnected).
-                if (SDL_GameControllerEventState(SDL_IGNORE) != SDL_IGNORE)
+                catch
                 {
-                    Logger.Error?.PrintMsg(LogClass.Application, "Couldn't change the state of game controller events.");
+                    Volatile.Write(ref _isRunning, false);
+                    _worker = null;
+                    _registeredWindowHandlers = null;
+                    _refereceCount = 0;
+
+                    if (initializationAttempted)
+                    {
+                        SDL_Quit();
+                    }
+
+                    throw;
                 }
-
-                if (SDL_JoystickEventState(SDL_ENABLE) < 0)
-                {
-                    Logger.Error?.PrintMsg(LogClass.Application, $"Failed to enable joystick event polling: {SDL_GetError()}");
-                }
-
-                // Disable all joysticks information, we don't need them no need to flood the event queue for that.
-                SDL_EventState(SDL_EventType.SDL_JOYAXISMOTION, SDL_DISABLE);
-                SDL_EventState(SDL_EventType.SDL_JOYBALLMOTION, SDL_DISABLE);
-                SDL_EventState(SDL_EventType.SDL_JOYHATMOTION, SDL_DISABLE);
-                SDL_EventState(SDL_EventType.SDL_JOYBUTTONDOWN, SDL_DISABLE);
-                SDL_EventState(SDL_EventType.SDL_JOYBUTTONUP, SDL_DISABLE);
-
-                SDL_EventState(SDL_EventType.SDL_CONTROLLERSENSORUPDATE, SDL_DISABLE);
-
-                _registeredWindowHandlers = new ConcurrentDictionary<uint, Action<SDL_Event>>();
-                _worker = new Thread(EventWorker);
-                _isRunning = true;
-                _worker.Start();
             }
         }
 
@@ -151,15 +171,36 @@ namespace Ryujinx.SDL2.Common
 
             using ManualResetEventSlim waitHandle = new(false);
 
-            while (_isRunning)
+            while (Volatile.Read(ref _isRunning))
             {
-                MainThreadDispatcher?.Invoke(() =>
+                try
                 {
-                    while (SDL_PollEvent(out SDL_Event evnt) != 0)
+                    MainThreadDispatcher?.Invoke(() =>
                     {
-                        HandleSDLEvent(ref evnt);
+                        while (SDL_PollEvent(out SDL_Event evnt) != 0)
+                        {
+                            HandleSDLEvent(ref evnt);
+                        }
+                    });
+                }
+                catch (OperationCanceledException)
+                {
+                    // A process-owned SDL worker can outlive an emulation session.
+                    // Skip this poll while no session main-thread pump is available.
+                }
+                catch (Exception exception)
+                {
+                    try
+                    {
+                        Logger.Error?.Print(
+                            LogClass.Application,
+                            $"SDL event polling failed; the process-owned worker will continue: {exception}");
                     }
-                });
+                    catch
+                    {
+                        // A logging failure must not terminate the process-owned worker.
+                    }
+                }
 
                 waitHandle.Wait(WaitTimeMs);
             }
@@ -180,11 +221,13 @@ namespace Ryujinx.SDL2.Common
 
                     if (_refereceCount == 0)
                     {
-                        _isRunning = false;
+                        Volatile.Write(ref _isRunning, false);
 
                         _worker?.Join();
 
                         SDL_Quit();
+                        _worker = null;
+                        _registeredWindowHandlers = null;
 
                         OnJoyStickConnected = null;
                         OnJoystickDisconnected = null;

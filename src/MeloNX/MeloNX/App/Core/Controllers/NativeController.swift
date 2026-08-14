@@ -67,13 +67,15 @@ class NativeController: BaseController {
     }
     
     func setupButtonChangeListener(_ button: GCControllerButtonInput, for key: VirtualControllerButton) {
-        button.valueChangedHandler = { [unowned self] _, _, pressed in
-            setButtonState(pressed ? 1 : 0, for: key)
+        button.valueChangedHandler = { [weak self] _, _, pressed in
+            self?.setButtonState(pressed ? 1 : 0, for: key)
         }
     }
 
     func setupStickChangeListener(_ button: GCControllerDirectionPad, for key: ThumbstickType) {
-        button.valueChangedHandler = { [unowned self] _, xValue, yValue in
+        button.valueChangedHandler = { [weak self] _, xValue, yValue in
+            guard let self else { return }
+
             switch key {
             case .left:
                 updateAxisValue(x: xValue, y: yValue, forAxis: 1)
@@ -84,8 +86,36 @@ class NativeController: BaseController {
     }
 
     func setupTriggerChangeListener(_ button: GCControllerButtonInput, for key: ThumbstickType) {
-        button.valueChangedHandler = { [unowned self] _, _, pressed in
-            setButtonState(pressed ? 1 : 0, for: key == .left ? .leftTrigger : .rightTrigger)
+        button.valueChangedHandler = { [weak self] _, _, pressed in
+            self?.setButtonState(
+                pressed ? 1 : 0,
+                for: key == .left ? .leftTrigger : .rightTrigger
+            )
         }
+    }
+
+    override func clearInputHandlers() {
+        if let gamepad = nativeController?.extendedGamepad {
+            gamepad.buttonA.valueChangedHandler = nil
+            gamepad.buttonB.valueChangedHandler = nil
+            gamepad.buttonX.valueChangedHandler = nil
+            gamepad.buttonY.valueChangedHandler = nil
+            gamepad.dpad.up.valueChangedHandler = nil
+            gamepad.dpad.down.valueChangedHandler = nil
+            gamepad.dpad.left.valueChangedHandler = nil
+            gamepad.dpad.right.valueChangedHandler = nil
+            gamepad.leftShoulder.valueChangedHandler = nil
+            gamepad.rightShoulder.valueChangedHandler = nil
+            gamepad.leftThumbstickButton?.valueChangedHandler = nil
+            gamepad.rightThumbstickButton?.valueChangedHandler = nil
+            gamepad.buttonMenu.valueChangedHandler = nil
+            gamepad.buttonOptions?.valueChangedHandler = nil
+            gamepad.leftThumbstick.valueChangedHandler = nil
+            gamepad.rightThumbstick.valueChangedHandler = nil
+            gamepad.leftTrigger.valueChangedHandler = nil
+            gamepad.rightTrigger.valueChangedHandler = nil
+        }
+
+        nativeController?.handlerQueue = .main
     }
 }

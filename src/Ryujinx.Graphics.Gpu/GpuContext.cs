@@ -1,6 +1,7 @@
 using Ryujinx.Common;
 using Ryujinx.Graphics.Device;
 using Ryujinx.Graphics.GAL;
+using Ryujinx.Graphics.GAL.Multithreading;
 using Ryujinx.Graphics.Gpu.Engine.GPFifo;
 using Ryujinx.Graphics.Gpu.Memory;
 using Ryujinx.Graphics.Gpu.Shader;
@@ -8,6 +9,7 @@ using Ryujinx.Graphics.Gpu.Synchronization;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 
 namespace Ryujinx.Graphics.Gpu
@@ -19,6 +21,7 @@ namespace Ryujinx.Graphics.Gpu
     {
         private const int NsToTicksFractionNumerator = 384;
         private const int NsToTicksFractionDenominator = 625;
+        private int _disposeState;
 
         /// <summary>
         /// Event signaled when the host emulation context is ready to be used by the gpu context.
@@ -434,23 +437,56 @@ namespace Ryujinx.Graphics.Gpu
         /// </summary>
         public void Dispose()
         {
-            GPFifo.Dispose();
-            HostInitalized.Dispose();
-            _gpuReadyEvent.Dispose();
+            if (Interlocked.Exchange(ref _disposeState, 1) != 0)
+            {
+                return;
+            }
+
+            ExceptionDispatchInfo firstException = null;
+
+            if (Renderer is ThreadedRenderer threadedRenderer)
+            {
+                CaptureDisposeException(
+                    threadedRenderer.TakeBackendThreadOwnership,
+                    ref firstException);
+            }
+
+            CaptureDisposeException(GPFifo.Dispose, ref firstException);
+            CaptureDisposeException(HostInitalized.Dispose, ref firstException);
+            CaptureDisposeException(_gpuReadyEvent.Dispose, ref firstException);
 
             // Has to be disposed before processing deferred actions, as it will produce some.
             foreach (var physicalMemory in PhysicalMemoryRegistry.Values)
             {
-                physicalMemory.Dispose();
+                CaptureDisposeException(physicalMemory.Dispose, ref firstException);
             }
 
-            SupportBufferUpdater.Dispose();
+            CaptureDisposeException(SupportBufferUpdater.Dispose, ref firstException);
 
             PhysicalMemoryRegistry.Clear();
 
-            RunDeferredActions();
+            while (DeferredActions.TryDequeue(out Action deferredAction))
+            {
+                CaptureDisposeException(deferredAction, ref firstException);
+            }
 
-            Renderer.Dispose();
+            CaptureDisposeException(Renderer.Dispose, ref firstException);
+
+            firstException?.Throw();
+        }
+
+        private static void CaptureDisposeException(
+            Action dispose,
+            ref ExceptionDispatchInfo firstException)
+        {
+            try
+            {
+                dispose();
+            }
+            catch (Exception exception)
+            {
+                firstException ??= ExceptionDispatchInfo.Capture(exception);
+            }
         }
     }
 }

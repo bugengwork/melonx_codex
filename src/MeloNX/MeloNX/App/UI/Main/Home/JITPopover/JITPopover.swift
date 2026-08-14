@@ -52,7 +52,7 @@ struct JITPopover: View {
                     Image(systemName: "info.circle.fill")
                         .foregroundColor(.blue)
                         .font(.system(size: 16))
-                    
+
                     Text("JIT compilation enables MeloNX to achieve maximum performance by dynamically translating and executing code on the fly.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
@@ -90,15 +90,17 @@ struct JITPopover: View {
             gameHandler.enableJIT()
             
             Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { timer in
-                isJIT = isJITEnabled()
-                
-                if isJIT {
-                    timer.invalidate()
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-                        presentationMode.wrappedValue.dismiss()
+                Task { @MainActor in
+                    isJIT = isJITEnabled()
+
+                    if isJIT {
+                        timer.invalidate()
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                            presentationMode.wrappedValue.dismiss()
+                        }
+                        onJITEnabled()
+                        Ryujinx.shared.checkForJIT()
                     }
-                    onJITEnabled()
-                    Ryujinx.shared.checkForJIT()
                 }
             }
         }

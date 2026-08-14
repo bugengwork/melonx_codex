@@ -1,11 +1,14 @@
 using Ryujinx.Graphics.GAL;
 using System;
+using System.Runtime.ExceptionServices;
+using System.Threading;
 
 namespace Ryujinx.Graphics.OpenGL.Queries
 {
     class Counters : IDisposable
     {
         private readonly CounterQueue[] _counterQueues;
+        private int _disposeState;
 
         public Counters()
         {
@@ -48,10 +51,26 @@ namespace Ryujinx.Graphics.OpenGL.Queries
 
         public void Dispose()
         {
+            if (Interlocked.Exchange(ref _disposeState, 1) != 0)
+            {
+                return;
+            }
+
+            ExceptionDispatchInfo firstException = null;
+
             foreach (var queue in _counterQueues)
             {
-                queue.Dispose();
+                try
+                {
+                    queue?.Dispose();
+                }
+                catch (Exception exception)
+                {
+                    firstException ??= ExceptionDispatchInfo.Capture(exception);
+                }
             }
+
+            firstException?.Throw();
         }
     }
 }

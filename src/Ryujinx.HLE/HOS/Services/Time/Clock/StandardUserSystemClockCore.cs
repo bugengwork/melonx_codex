@@ -1,6 +1,7 @@
 using Ryujinx.Cpu;
 using Ryujinx.HLE.HOS.Kernel.Threading;
 using System;
+using System.Threading;
 
 namespace Ryujinx.HLE.HOS.Services.Time.Clock
 {
@@ -65,7 +66,12 @@ namespace Ryujinx.HLE.HOS.Services.Time.Clock
 
         internal void CreateAutomaticCorrectionEvent(Horizon system)
         {
-            _autoCorrectionEvent = new KEvent(system.KernelContext);
+            Interlocked.Exchange(ref _autoCorrectionEvent, new KEvent(system.KernelContext));
+        }
+
+        internal bool ReleaseAutomaticCorrectionEvent()
+        {
+            return Interlocked.Exchange(ref _autoCorrectionEvent, null) != null;
         }
 
         public ResultCode SetAutomaticCorrectionEnabled(ITickSource tickSource, bool autoCorrectionEnabled)

@@ -79,7 +79,7 @@ struct LaunchGameIntentDef: AppIntent {
 @available(iOS 16.0, *)
 struct GameOptionsProvider: DynamicOptionsProvider {
     func results() async throws -> [String] {
-        let dynamicGames = Ryujinx.shared.loadGames()
+        let dynamicGames = await Ryujinx.shared.loadGames()
         
         return dynamicGames.map { $0.titleName }
     }

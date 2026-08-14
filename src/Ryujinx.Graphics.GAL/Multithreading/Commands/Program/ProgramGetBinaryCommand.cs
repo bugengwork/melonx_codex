@@ -17,9 +17,11 @@ namespace Ryujinx.Graphics.GAL.Multithreading.Commands.Program
 
         public static void Run(ref ProgramGetBinaryCommand command, ThreadedRenderer threaded, IRenderer renderer)
         {
-            byte[] result = command._program.Get(threaded).Base.GetBinary();
+            ThreadedProgram program = command._program.Get(threaded);
+            ResultBox<byte[]> resultBox = command._result.Get(threaded);
+            byte[] result = program.Base.GetBinary();
 
-            command._result.Get(threaded).Result = result;
+            resultBox.Result = result;
         }
     }
 }

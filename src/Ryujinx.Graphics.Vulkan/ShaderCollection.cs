@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
+using System.Runtime.ExceptionServices;
 using System.Threading.Tasks;
 
 namespace Ryujinx.Graphics.Vulkan
@@ -81,7 +82,7 @@ namespace Ryujinx.Graphics.Vulkan
 
             gd.Shaders.Add(this);
 
-            var internalShaders = new Shader[shaders.Length];
+            _shaders = new Shader[shaders.Length];
 
             _infos = new PipelineShaderStageCreateInfo[shaders.Length];
 
@@ -109,10 +110,8 @@ namespace Ryujinx.Graphics.Vulkan
                     IsCompute = true;
                 }
 
-                internalShaders[i] = shader;
+                _shaders[i] = shader;
             }
-
-            _shaders = internalShaders;
 
             bool usePushDescriptors = !isMinimal &&
                 VulkanConfiguration.UsePushDescriptors &&
@@ -478,6 +477,11 @@ namespace Ryujinx.Graphics.Vulkan
             }
         }
 
+        internal void WaitForBackgroundCompilation()
+        {
+            _compileTask?.GetAwaiter().GetResult();
+        }
+
         private void EnsureShadersReady()
         {
             if (!_initialized)
@@ -716,16 +720,26 @@ namespace Ryujinx.Graphics.Vulkan
                     return;
                 }
 
-                for (int i = 0; i < _shaders.Length; i++)
+                ExceptionDispatchInfo firstException = null;
+
+                CaptureDisposeException(
+                    WaitForBackgroundCompilation,
+                    ref firstException);
+
+                if (_shaders != null)
                 {
-                    _shaders[i].Dispose();
+                    for (int i = 0; i < _shaders.Length; i++)
+                    {
+                        Shader shader = _shaders[i];
+                        CaptureDisposeException(() => shader?.Dispose(), ref firstException);
+                    }
                 }
 
                 if (_graphicsPipelineCache != null)
                 {
                     foreach (Auto<DisposablePipeline> pipeline in _graphicsPipelineCache.Values)
                     {
-                        pipeline?.Dispose();
+                        CaptureDisposeException(() => pipeline?.Dispose(), ref firstException);
                     }
                 }
 
@@ -733,25 +747,45 @@ namespace Ryujinx.Graphics.Vulkan
                 {
                     foreach (Auto<DisposablePipeline> pipeline in _computePipelineCache.Values)
                     {
-                        pipeline.Dispose();
+                        CaptureDisposeException(pipeline.Dispose, ref firstException);
                     }
                 }
 
-                for (int i = 0; i < Templates.Length; i++)
+                if (Templates != null)
                 {
-                    Templates[i]?.Dispose();
+                    for (int i = 0; i < Templates.Length; i++)
+                    {
+                        DescriptorSetTemplate template = Templates[i];
+                        CaptureDisposeException(() => template?.Dispose(), ref firstException);
+                    }
                 }
 
                 if (_dummyRenderPass.Value.Handle != 0)
                 {
-                    _dummyRenderPass.Dispose();
+                    CaptureDisposeException(_dummyRenderPass.Dispose, ref firstException);
                 }
+
+                firstException?.Throw();
             }
         }
 
         public void Dispose()
         {
             Dispose(true);
+        }
+
+        private static void CaptureDisposeException(
+            Action action,
+            ref ExceptionDispatchInfo firstException)
+        {
+            try
+            {
+                action();
+            }
+            catch (Exception exception)
+            {
+                firstException ??= ExceptionDispatchInfo.Capture(exception);
+            }
         }
     }
 }

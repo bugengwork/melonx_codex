@@ -16,8 +16,15 @@ namespace Ryujinx.Graphics.GAL.Multithreading.Commands
         public static void Run(ref SetVertexAttribsCommand command, ThreadedRenderer threaded, IRenderer renderer)
         {
             ReadOnlySpan<VertexAttribDescriptor> vertexAttribs = command._vertexAttribs.Get(threaded);
-            renderer.Pipeline.SetVertexAttribs(vertexAttribs);
-            command._vertexAttribs.Dispose(threaded);
+
+            try
+            {
+                renderer.Pipeline.SetVertexAttribs(vertexAttribs);
+            }
+            finally
+            {
+                command._vertexAttribs.Dispose(threaded);
+            }
         }
     }
 }

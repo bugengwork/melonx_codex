@@ -14,7 +14,6 @@ import CoreMotion
 enum ControllerSource {
     case onScreenVirtual
     case native
-    case remote
 }
 
 class BaseController: Equatable, Identifiable {
@@ -41,8 +40,6 @@ class BaseController: Equatable, Identifiable {
             return "MeloNX Virtual Controller"
         case .native:
             return nativeController?.vendorName ?? "Unknown"
-        case .remote:
-            return "MeloNX Remote Controller"
         }
     }
     var nativeController: GCController?
@@ -56,6 +53,8 @@ class BaseController: Equatable, Identifiable {
     
     private var hapticEngine: CHHapticEngine?
     private var rumbleController: RumbleController?
+    private let lifecycleLock = NSLock()
+    private var cleanupRequested = false
     var motionManager = CMMotionManager()
 
     var inputQueue: DispatchQueue
@@ -114,7 +113,7 @@ class BaseController: Equatable, Identifiable {
     
     func setupHaptics() {
         DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
+            guard let self, !self.isCleanupRequested else { return }
             
             let createHaptic: (Bool) -> Void = { device in
                 if let engine = self.hapticEngine {
@@ -126,12 +125,18 @@ class BaseController: Equatable, Identifiable {
                     }
                 }
                 
-                RegisterCallbackWithData("rumble-\(self.id)") { data in
-                    if let rumbleData = RumbleData(data: data ?? Data()) {
-                        self.rumbleController?.rumble(lowFreq: rumbleData.lowFrequency,
-                                                    highFreq: rumbleData.highFrequency,
-                                                    durationMs: rumbleData.durationMs)
+                RegisterCallbackWithData("rumble-\(self.id)") { [weak self] data in
+                    guard let self,
+                          !self.isCleanupRequested,
+                          let rumbleData = RumbleData(data: data ?? Data()) else {
+                        return
                     }
+
+                    self.rumbleController?.rumble(
+                        lowFreq: rumbleData.lowFrequency,
+                        highFreq: rumbleData.highFrequency,
+                        durationMs: rumbleData.durationMs
+                    )
                 }
             }
             
@@ -146,10 +151,38 @@ class BaseController: Equatable, Identifiable {
     }
 
     func cleanup() {
-        inputQueue.async { [weak self] in
-            guard let self = self else { return }
-            RyujinxBridge.detachGamepad(self.pointer)
+        lifecycleLock.lock()
+        guard !cleanupRequested else {
+            lifecycleLock.unlock()
+            return
         }
+        cleanupRequested = true
+        lifecycleLock.unlock()
+
+        let controllerPointer = pointer
+        inputQueue.async { [self] in
+            clearInputHandlers()
+            nativeController?.motion?.valueChangedHandler = nil
+            nativeController?.motion?.sensorsActive = false
+            motionManager.stopDeviceMotionUpdates()
+            motionOperation.cancelAllOperations()
+            RyujinxBridge.detachGamepad(controllerPointer)
+        }
+
+        DispatchQueue.main.async { [self] in
+            hapticEngine?.stop(completionHandler: nil)
+            rumbleController = nil
+            hapticEngine = nil
+        }
+    }
+
+    func clearInputHandlers() {
+    }
+
+    private var isCleanupRequested: Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return cleanupRequested
     }
     
     static func == (lhs: BaseController, rhs: BaseController) -> Bool {

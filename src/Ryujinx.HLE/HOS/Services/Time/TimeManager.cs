@@ -11,6 +11,8 @@ namespace Ryujinx.HLE.HOS.Services.Time
     class TimeManager
     {
         private static TimeManager _instance;
+        private readonly object _sessionLock = new();
+        private Switch _sessionDevice;
 
         public static TimeManager Instance
         {
@@ -53,10 +55,46 @@ namespace Ryujinx.HLE.HOS.Services.Time
 
         public void Initialize(Switch device, Horizon system, KSharedMemory sharedMemory, SharedMemoryStorage timeSharedMemoryStorage, int timeSharedMemorySize)
         {
-            SharedMemory.Initialize(device, sharedMemory, timeSharedMemoryStorage, timeSharedMemorySize);
+            lock (_sessionLock)
+            {
+                _sessionDevice = device;
 
-            // Here we use system on purpose as device. System isn't initialized at this point.
-            StandardUserSystemClock.CreateAutomaticCorrectionEvent(system);
+                try
+                {
+                    SharedMemory.Initialize(device, sharedMemory, timeSharedMemoryStorage, timeSharedMemorySize);
+
+                    // Here we use system on purpose as device. System isn't initialized at this point.
+                    StandardUserSystemClock.CreateAutomaticCorrectionEvent(system);
+                }
+                catch
+                {
+                    _sessionDevice = null;
+                    SharedMemory.ReleaseSession(device);
+                    StandardUserSystemClock.ReleaseAutomaticCorrectionEvent();
+
+                    throw;
+                }
+            }
+        }
+
+        internal bool ReleaseSession(Switch device)
+        {
+            lock (_sessionLock)
+            {
+                if (!ReferenceEquals(_sessionDevice, device))
+                {
+                    return false;
+                }
+
+                // Clear the owner first so a repeated release remains a no-op even if
+                // one of the resource cleanup methods changes to throw in the future.
+                _sessionDevice = null;
+
+                SharedMemory.ReleaseSession(device);
+                StandardUserSystemClock.ReleaseAutomaticCorrectionEvent();
+
+                return true;
+            }
         }
 
         public void InitializeTimeZone(Switch device)

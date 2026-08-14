@@ -20,9 +20,10 @@ namespace Ryujinx.Graphics.GAL.Multithreading.Commands.Buffer
 
         public static void Run(ref BufferGetDataCommand command, ThreadedRenderer threaded, IRenderer renderer)
         {
+            ResultBox<PinnedSpan<byte>> resultBox = command._result.Get(threaded);
             PinnedSpan<byte> result = renderer.GetBufferData(threaded.Buffers.MapBuffer(command._buffer), command._offset, command._size);
 
-            command._result.Get(threaded).Result = result;
+            resultBox.Result = result;
         }
     }
 }

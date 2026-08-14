@@ -3,6 +3,7 @@
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <RuntimeIdentifiers>ios-arm64</RuntimeIdentifiers>
+    <SupportedOSPlatformVersion>15.0</SupportedOSPlatformVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Version>1.0.0-dirty</Version>
     <DefineConstants Condition=" '$(ExtraDefineConstants)' != '' ">$(DefineConstants);$(ExtraDefineConstants)</DefineConstants>
@@ -54,6 +55,8 @@
     <ItemGroup>
           <!-- <LinkerArg Include="-Wl,-ld_classic" /> -->
       <LinkerArg Include="-flto -Ofast" />
+      <LinkerArg Include="-miphoneos-version-min=$(SupportedOSPlatformVersion)"
+                 Condition=" !$(RuntimeIdentifier.Contains('simulator')) "/>
       <LinkerArg Include="-isysroot %22$(XCodePath)Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator.sdk%22"
                  Condition=" $(RuntimeIdentifier.Contains('simulator')) "/>
       <LinkerArg Include="-isysroot %22$(XCodePath)Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk%22"

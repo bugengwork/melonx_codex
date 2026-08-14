@@ -8,7 +8,91 @@
 
 import Foundation
 
+struct BoundedLogBuffer {
+    struct Snapshot {
+        let logs: [String]
+        let nextCursor: Int
+    }
+
+    private struct Entry {
+        let value: String
+        let byteCount: Int
+    }
+
+    private let maxEntries: Int
+    private let maxBytes: Int
+    private var storage: [Entry?]
+    private var startIndex = 0
+    private(set) var count = 0
+    private var storedBytes = 0
+    private(set) var nextCursor = 0
+
+    init(maxEntries: Int, maxBytes: Int) {
+        precondition(maxEntries > 0)
+        precondition(maxBytes > 0)
+        self.maxEntries = maxEntries
+        self.maxBytes = maxBytes
+        storage = Array(repeating: nil, count: maxEntries)
+    }
+
+    mutating func append(_ value: String) {
+        if count == maxEntries {
+            removeOldest()
+        }
+
+        let entry = Entry(value: value, byteCount: value.utf8.count)
+        let insertionIndex = (startIndex + count) % maxEntries
+        storage[insertionIndex] = entry
+        count += 1
+        storedBytes += entry.byteCount
+        nextCursor += 1
+
+        while storedBytes > maxBytes, count > 0 {
+            removeOldest()
+        }
+    }
+
+    func allLogs() -> [String] {
+        snapshot(since: nextCursor - count).logs
+    }
+
+    func snapshot(since cursor: Int) -> Snapshot {
+        let oldestCursor = nextCursor - count
+        let firstCursor = min(max(cursor, oldestCursor), nextCursor)
+        let offset = firstCursor - oldestCursor
+        var logs: [String] = []
+        logs.reserveCapacity(count - offset)
+
+        for index in offset..<count {
+            let storageIndex = (startIndex + index) % maxEntries
+            if let entry = storage[storageIndex] {
+                logs.append(entry.value)
+            }
+        }
+
+        return Snapshot(logs: logs, nextCursor: nextCursor)
+    }
+
+    private mutating func removeOldest() {
+        guard count > 0, let entry = storage[startIndex] else {
+            return
+        }
+
+        storedBytes -= entry.byteCount
+        storage[startIndex] = nil
+        startIndex = (startIndex + 1) % maxEntries
+        count -= 1
+    }
+}
+
 final class LogCapture: ObservableObject {
+    private static let capturedLogEntryLimit = 4_096
+    private static let capturedLogByteLimit = 4 * 1_024 * 1_024
+    private static let logPrefixRegex = try! NSRegularExpression(
+        pattern: "\\d{2}:\\d{2}:\\d{2}\\.\\d{3} \\|[A-Z]+\\|",
+        options: .caseInsensitive
+    )
+
     static let shared = LogCapture()
 
     private var stdoutPipe: Pipe?
@@ -17,10 +101,20 @@ final class LogCapture: ObservableObject {
     private let originalStderr: Int32
 
     private var continuation: AsyncStream<String>.Continuation?
-    public private(set) var capturedLogs: [String] = []
+    private let capturedLogsLock = NSLock()
+    private var capturedLogStorage = BoundedLogBuffer(
+        maxEntries: capturedLogEntryLimit,
+        maxBytes: capturedLogByteLimit
+    )
+
+    public var capturedLogs: [String] {
+        capturedLogsLock.lock()
+        defer { capturedLogsLock.unlock() }
+        return capturedLogStorage.allLogs()
+    }
 
     lazy var logs: AsyncStream<String> = {
-        AsyncStream { continuation in
+        AsyncStream(bufferingPolicy: .bufferingNewest(4)) { continuation in
             self.continuation = continuation
             continuation.onTermination = { _ in
                 self.continuation = nil
@@ -53,6 +147,18 @@ final class LogCapture: ObservableObject {
         stderrPipe?.fileHandleForReading.readabilityHandler = nil
     }
 
+    func capturedLogCount() -> Int {
+        capturedLogsLock.lock()
+        defer { capturedLogsLock.unlock() }
+        return capturedLogStorage.nextCursor
+    }
+
+    func capturedLogsSnapshot(since index: Int) -> BoundedLogBuffer.Snapshot {
+        capturedLogsLock.lock()
+        defer { capturedLogsLock.unlock() }
+        return capturedLogStorage.snapshot(since: index)
+    }
+
     private func redirectOutput(to pipe: Pipe, fileDescriptor: Int32) {
         dup2(pipe.fileHandleForWriting.fileDescriptor, fileDescriptor)
     }
@@ -69,7 +175,9 @@ final class LogCapture: ObservableObject {
                   let cleanedLog = self.cleanLog(logString),
                   !cleanedLog.0.isEmpty else { return }
 
-            self.capturedLogs.append(cleanedLog.1)
+            self.capturedLogsLock.lock()
+            self.capturedLogStorage.append(cleanedLog.1)
+            self.capturedLogsLock.unlock()
             self.continuation?.yield(cleanedLog.0) 
 
         }
@@ -77,34 +185,49 @@ final class LogCapture: ObservableObject {
 
     private func cleanLog(_ raw: String) -> (String, String)? {
         let lines = raw.split(separator: "\n")
-        
-        let filteredLines = lines.filter { line in
-            if UserDefaults.standard.bool(forKey: "showFullLogs") {
-                return true
+        let showFullLogs = UserDefaults.standard.bool(forKey: "showFullLogs")
+        var displayedLines: [String] = []
+        var capturedLines: [String] = []
+        displayedLines.reserveCapacity(lines.count)
+        capturedLines.reserveCapacity(lines.count)
+
+        for line in lines {
+            let lineString = String(line)
+            let cleanedLine: String
+
+            if let tabRange = lineString.range(of: "\t") {
+                cleanedLine = lineString[tabRange.upperBound...]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                cleanedLine = lineString.trimmingCharacters(in: .whitespacesAndNewlines)
             }
-            
-            let regex = try? NSRegularExpression(pattern: "\\d{2}:\\d{2}:\\d{2}\\.\\d{3} \\|[A-Z]+\\|", options: .caseInsensitive)
-            let matches = regex?.matches(in: String(line), options: [], range: NSRange(location: 0, length: line.utf16.count)) ?? []
-            
-            return matches.count >= 1
+
+            capturedLines.append(cleanedLine)
+
+            if showFullLogs {
+                displayedLines.append(cleanedLine)
+                continue
+            }
+
+            let range = NSRange(lineString.startIndex..., in: lineString)
+            if Self.logPrefixRegex.firstMatch(
+                in: lineString,
+                options: [],
+                range: range
+            ) != nil {
+                displayedLines.append(cleanedLine)
+            }
         }
 
-        let cleaned = filteredLines.map { line -> String in
-            if let tabRange = line.range(of: "\t") {
-                return line[tabRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-            return line.trimmingCharacters(in: .whitespacesAndNewlines)
-        }.joined(separator: "\n")
-        
-        
-        let cleaned2 = lines.map { line -> String in
-            if let tabRange = line.range(of: "\t") {
-                return line[tabRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-            return line.trimmingCharacters(in: .whitespacesAndNewlines)
-        }.joined(separator: "\n")
+        let displayedLog = displayedLines.joined(separator: "\n")
+        guard !displayedLog.isEmpty else {
+            return nil
+        }
 
-        return cleaned.isEmpty ? nil : (cleaned.replacingOccurrences(of: "\n\n", with: "\n"), cleaned2)
+        return (
+            displayedLog,
+            capturedLines.joined(separator: "\n")
+        )
     }
 
     deinit {
